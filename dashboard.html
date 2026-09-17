@@ -190,6 +190,9 @@ a:hover{text-decoration:underline}
       <button class="main-nav-btn active" id="btnNavGateway" onclick="switchMainTab('gateway')">
         网关与运维
       </button>
+      <button class="main-nav-btn" id="btnNavRecent" onclick="switchMainTab('recent')">
+        最近请求
+      </button>
       <button class="main-nav-btn" id="btnNavAnalytics" onclick="switchMainTab('analytics')">
         数据指标看板
       </button>
@@ -286,16 +289,12 @@ a:hover{text-decoration:underline}
   <!-- 融合后的：模型性能与用量矩阵 -->
   
 
-  <section>
-    <h2>最近请求</h2>
-    <div id="recent"></div>
-  </section>
-
   <!-- 版本模型库与能力清单 -->
   <section>
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
       <h2 style="margin:0">当前版本模型库与能力清单 <em id="availModelCount"></em></h2>
       <div style="display:flex;align-items:center;gap:10px">
+        <button class="sec mini" id="btnModelSync" onclick="syncModels(this)">从上游同步</button>
         <button class="sec mini" id="btnModelEdit" onclick="toggleModelEdit()">编辑列表</button>
         <button class="primary mini" id="btnModelSave" style="display:none" onclick="saveModelConfig(this)">保存</button>
       </div>
@@ -363,6 +362,19 @@ a:hover{text-decoration:underline}
 
   
   </div><!-- /pageGateway -->
+  <div id="pageRecent" style="display:none">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:12px">
+      <div>
+        <h2 style="margin:0;font-size:16px;color:var(--fg)">最近请求</h2>
+        <div style="font-size:12px;color:var(--dim);margin-top:4px">展示当前出口最近 200 条请求，包含失败与性能明细</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <button class="sec mini" id="btnRecentFailOnly" onclick="toggleRecentFailOnly()">仅看失败</button>
+        <button class="sec mini" onclick="refreshRecent(true)">刷新</button>
+      </div>
+    </div>
+    <div id="recent"></div>
+  </div>
   <div id="pageAnalytics" style="display:none">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:12px">
       <div>
@@ -800,6 +812,22 @@ async function loadModels(){
   }
 }
 
+async function syncModels(btn){
+  if(btn){ btn.disabled = true; btn.textContent = '同步中...'; }
+  try{
+    const r = await postJSON('/models/sync', {realm: window.VIEW_REALM});
+    const presets = (r.presets || []).join('、');
+    toast('模型已同步：发现 ' + (r.discovered || []).length + ' 个，隐藏 ' + (r.hidden_count || 0) + ' 个'
+      + (presets ? '；预设 ' + presets : ''), 'ok');
+    await loadModels();
+    if(typeof loadAnalytics === 'function') loadAnalytics();
+  }catch(e){
+    toast('同步失败: ' + e.message, 'bad');
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '从上游同步'; }
+  }
+}
+
 function renderAvailableModels(){
   const tb = document.querySelector('#modelsTable tbody');
   if(!tb) return;
@@ -1047,11 +1075,12 @@ async function loadKeyUsage(){
     var r = await getJSON('/usage/by-key');
     var rows = r.keys || [];
     if(!rows.length){
-      body.innerHTML = '<p class="hint">暂无 Key 维度记录。埋点之前的流水无法回填，新请求会开始统计。</p>';
+      body.innerHTML = '<p class="hint">暂无 API Key 维度记录，新请求会开始统计。</p>';
       return;
     }
     body.innerHTML = '<table class="tbl"><thead><tr>'
-      + '<th>API Key</th><th>请求</th><th>失败</th><th>tokens</th><th>积分</th><th>命中账号</th>'
+      + '<th>API Key</th><th>请求</th><th>成功率</th><th>总 Token</th><th>缓存命中</th>'
+      + '<th>平均 TTFT</th><th>平均速度</th><th>平均耗时</th><th>积分</th><th>模型 / 账号</th>'
       + '</tr></thead><tbody>'
       + rows.map(function(k){
           var models = Object.keys(k.models || {}).slice(0, 3).join('、');
@@ -1061,13 +1090,18 @@ async function loadKeyUsage(){
           return '<tr>'
             + '<td><b>' + esc(k.label || '(未命名)') + '</b>'
             + (k.key_id ? ' <span class="mono" style="color:var(--dim);font-size:11px">' + esc(k.key_id) + '</span>' : '')
-            + (models ? '<div class="mono" style="font-size:11px;color:var(--dim)">' + esc(models) + '</div>' : '')
             + '</td>'
             + '<td>' + fmt(k.requests) + '</td>'
-            + '<td>' + (k.errors ? '<span style="color:var(--warn)">' + k.errors + '</span>' : '0') + '</td>'
+            + '<td>' + pct(k.success_rate_pct || 0) + (k.errors ? ' <span class="badge bad mini">' + k.errors + ' 失败</span>' : '') + '</td>'
             + '<td>' + fmt(k.total_tokens) + '</td>'
+            + '<td>' + pct(k.cache_hit_pct || 0) + '</td>'
+            + '<td>' + (k.ttft_ms_avg ? ms(k.ttft_ms_avg) : '—') + '</td>'
+            + '<td>' + (k.tokens_per_sec_avg ? k.tokens_per_sec_avg.toFixed(1) + ' tok/s' : '—') + '</td>'
+            + '<td>' + (k.elapsed_ms_avg ? ms(k.elapsed_ms_avg) : '—') + '</td>'
             + '<td><b style="color:var(--accent2)">' + (k.credit || 0).toFixed(2) + '</b></td>'
-            + '<td style="font-size:12px">' + esc(accts) + '</td>'
+            + '<td style="font-size:12px">'
+            + (models ? '<div class="mono" style="font-size:11px">' + esc(models) + '</div>' : '')
+            + '<div style="color:var(--dim)">' + esc(accts) + '</div></td>'
             + '</tr>';
         }).join('')
       + '</tbody></table>';
@@ -1868,6 +1902,10 @@ async function doImportDesktop(btn, path, realm){
 
 /* ------------------------------- dashboard ------------------------------ */
 let REFRESH_BUSY = false;
+let RECENT_BUSY = false;
+let RECENT_FAIL_ONLY = false;
+let RECENT_ROWS = [];
+
 async function refresh(){
   // 5 秒轮询：上一轮尚未返回就跳过本轮，避免请求堆积把服务端拖慢
   if(REFRESH_BUSY) return;
@@ -1875,12 +1913,61 @@ async function refresh(){
   try { await refreshInner(); }
   finally { REFRESH_BUSY = false; }
 }
-async function refreshInner(){
-  let usage, recent, perf;
+
+async function refreshRecent(showToast){
+  if(RECENT_BUSY || currentMainTab !== 'recent') return;
+  RECENT_BUSY = true;
   try{
-    [usage, recent, perf] = await Promise.all([
+    const r = await getJSON('/usage/recent?limit=200&realm=' + encodeURIComponent(window.VIEW_REALM));
+    RECENT_ROWS = r.rows || [];
+    renderRecent();
+    if(showToast) toast('已刷新最近请求', 'ok');
+  }catch(e){
+    if(String(e.message) !== 'unauthorized') toast('最近请求加载失败: ' + e.message, 'bad');
+  }finally{
+    RECENT_BUSY = false;
+  }
+}
+
+function toggleRecentFailOnly(){
+  RECENT_FAIL_ONLY = !RECENT_FAIL_ONLY;
+  const btn = document.getElementById('btnRecentFailOnly');
+  if(btn){
+    btn.classList.toggle('active', RECENT_FAIL_ONLY);
+    btn.textContent = RECENT_FAIL_ONLY ? '显示全部' : '仅看失败';
+  }
+  renderRecent();
+}
+
+function renderRecent(){
+  const el = document.getElementById('recent');
+  if(!el) return;
+  const rows = RECENT_FAIL_ONLY ? RECENT_ROWS.filter(r => r.error) : RECENT_ROWS;
+  const last = rows.slice(-200).reverse();
+  el.innerHTML = last.length ?
+    '<table><thead><tr><th>时间</th><th>模型</th><th>账号</th><th>模式</th><th>耗时</th><th>首字</th><th>速度</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>总 token</th></tr></thead><tbody>'
+    + last.map(r => '<tr>'
+        + '<td class="mono">' + esc((r.iso||'').replace('T',' ').slice(5)) + '</td>'
+        + '<td class="mono">' + esc(r.model) + (r.resolved_model && r.resolved_model !== r.model ? '<div style="font-size:10px;color:var(--dim)">' + esc(r.resolved_model) + '</div>' : '') + '</td>'
+        + '<td class="mono" style="font-size:11px;color:var(--dim)">' + esc((r.account||'—').slice(0,8)) + '</td>'
+        + '<td><span class="badge ' + (r.stream?'s':'') + '">' + (r.stream?'流式':'非流式') + '</span></td>'
+        + '<td>' + (r.error ? '<span class="badge bad">失败</span>' : (r.elapsed_ms!=null ? fmt(r.elapsed_ms)+' ms' : '—')) + '</td>'
+        + '<td>' + (r.ttft_ms!=null ? fmt(r.ttft_ms)+' ms' : '—') + '</td>'
+        + '<td>' + (r.tokens_per_sec ? r.tokens_per_sec.toFixed(1) : '—') + '</td>'
+        + '<td>' + fmt(r.prompt_tokens) + '</td>'
+        + '<td>' + fmt(r.completion_tokens) + '</td>'
+        + '<td style="color:var(--think)">' + fmt(r.reasoning_tokens) + '</td>'
+        + '<td>' + (r.cache_hit_pct!=null ? r.cache_hit_pct+'%' : '—') + '</td>'
+        + '<td><b>' + fmt(r.total_tokens) + '</b></td>'
+      + '</tr>').join('') + '</tbody></table>'
+    : '<div class="empty">' + (RECENT_FAIL_ONLY ? '没有失败请求' : '还没有请求记录') + '</div>';
+}
+
+async function refreshInner(){
+  let usage, perf;
+  try{
+    [usage, perf] = await Promise.all([
       getJSON('/usage?realm=' + encodeURIComponent(window.VIEW_REALM)),
-      getJSON('/usage/recent?limit=60&realm=' + encodeURIComponent(window.VIEW_REALM)),
       getJSON('/usage/perf?realm=' + encodeURIComponent(window.VIEW_REALM)),
     ]);
     document.getElementById('statusDot').className = 'dot';
@@ -1896,7 +1983,7 @@ async function refreshInner(){
   document.getElementById('meta').innerHTML =
     '账号 <b>' + esc((t.account && t.account.uid || '—').slice(0,8)) + '</b>'
     + (t.accounts ? ' · 池 <b>' + t.accounts_ready + '/' + t.accounts + '</b>' : '')
-    + '<br>统计开始于 <b>' + esc(t.since || '—') + '</b> · 明细 <b>' + fmt(recent.total) + '</b> 条';
+    + '<br>统计开始于 <b>' + esc(t.since || '—') + '</b> · 请求 <b>' + fmt(t.requests || 0) + '</b> 条';
   document.getElementById('logfile').textContent = t.log_file || '';
   const rEl = document.getElementById('realm'); if(rEl) rEl.textContent = t.realm ? ' · ' + t.realm : '';
 
@@ -2019,24 +2106,6 @@ async function refreshInner(){
       + '</tr></thead><tbody>' + summaryRow + rows + '</tbody></table>';
   }
 
-  const last = (recent.rows || []).slice(-60).reverse();
-  document.getElementById('recent').innerHTML = last.length ?
-    '<table><thead><tr><th>时间</th><th>模型</th><th>账号</th><th>模式</th><th>耗时</th><th>首字</th><th>速度</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>总 token</th></tr></thead><tbody>'
-    + last.map(r => '<tr>'
-        + '<td class="mono">' + esc((r.iso||'').replace('T',' ').slice(5)) + '</td>'
-        + '<td class="mono">' + esc(r.model) + '</td>'
-        + '<td class="mono" style="font-size:11px;color:var(--dim)">' + esc((r.account||'—').slice(0,8)) + '</td>'
-        + '<td><span class="badge ' + (r.stream?'s':'') + '">' + (r.stream?'流式':'非流式') + '</span></td>'
-        + '<td>' + (r.error ? '<span class="badge bad">失败</span>' : (r.elapsed_ms!=null ? fmt(r.elapsed_ms)+' ms' : '—')) + '</td>'
-        + '<td>' + (r.ttft_ms!=null ? fmt(r.ttft_ms)+' ms' : '—') + '</td>'
-        + '<td>' + (r.tokens_per_sec ? r.tokens_per_sec.toFixed(1) : '—') + '</td>'
-        + '<td>' + fmt(r.prompt_tokens) + '</td>'
-        + '<td>' + fmt(r.completion_tokens) + '</td>'
-        + '<td style="color:var(--think)">' + fmt(r.reasoning_tokens) + '</td>'
-        + '<td>' + (r.cache_hit_pct!=null ? r.cache_hit_pct+'%' : '—') + '</td>'
-        + '<td><b>' + fmt(r.total_tokens) + '</b></td>'
-      + '</tr>').join('') + '</tbody></table>'
-    : '<div class="empty">还没有请求记录</div>';
 }
 
 (async function initDashboard(){
@@ -2138,7 +2207,7 @@ async function startDashboard(){
   await refresh();
   await loadSettings();
   const tabFromUrl = new URLSearchParams(window.location.search).get('tab');
-  if(tabFromUrl && ['gateway', 'analytics', 'logs', 'settings'].includes(tabFromUrl)){
+  if(tabFromUrl && ['gateway', 'recent', 'analytics', 'logs', 'settings'].includes(tabFromUrl)){
     switchMainTab(tabFromUrl);
   }
   // Polling only starts after the panel is unlocked, so a locked browser
@@ -2148,6 +2217,7 @@ async function startDashboard(){
     setInterval(() => {
       if(!PANEL_READY) return;
       if(currentMainTab === 'analytics') loadAnalytics();
+      if(currentMainTab === 'recent') refreshRecent(false);
     }, 5000),
     setInterval(refresh, 5000),
     setInterval(loadSchedulerStatus, 30000),
@@ -2539,15 +2609,18 @@ async function saveApiKeys(btn){
 function switchMainTab(tab){
   currentMainTab = tab;
   const btnGateway = document.getElementById('btnNavGateway');
+  const btnRecent = document.getElementById('btnNavRecent');
   const btnAnalytics = document.getElementById('btnNavAnalytics');
   const btnLogs = document.getElementById('btnNavLogs');
   const btnSettings = document.getElementById('btnNavSettings');
   const pageGateway = document.getElementById('pageGateway');
+  const pageRecent = document.getElementById('pageRecent');
   const pageAnalytics = document.getElementById('pageAnalytics');
   const pageLogs = document.getElementById('pageLogs');
   const pageSettings = document.getElementById('pageSettings');
   const tabs = [
     ['gateway', btnGateway, pageGateway],
+    ['recent', btnRecent, pageRecent],
     ['analytics', btnAnalytics, pageAnalytics],
     ['logs', btnLogs, pageLogs],
     ['settings', btnSettings, pageSettings]
@@ -2558,6 +2631,7 @@ function switchMainTab(tab){
     btn.classList.toggle('active', on);
     page.style.display = on ? 'block' : 'none';
   });
+  if(tab === 'recent') refreshRecent(false);
   if(tab === 'analytics') loadAnalytics();
   if(tab === 'settings') loadSettings();
   if(tab === 'logs'){

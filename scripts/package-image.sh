@@ -59,6 +59,7 @@ if [[ "${SKIP_TESTS:-0}" != "1" ]]; then
     "$VENV_DIR/bin/python" _test_custom_tools.py
     "$VENV_DIR/bin/python" _test_model_cooldown.py
     "$VENV_DIR/bin/python" _test_model_config.py
+    "$VENV_DIR/bin/python" _test_usage_key.py
   )
 else
   printf '\n[1/4] regression tests skipped (SKIP_TESTS=1)\n'

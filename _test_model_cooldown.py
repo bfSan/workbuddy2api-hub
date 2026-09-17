@@ -10,6 +10,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import wb_accounts
+import wb_proxy as P
 
 PASS = FAIL = 0
 
@@ -72,6 +73,14 @@ check("public has cooldowns list", isinstance(pub.get("cooldowns"), list))
 entry = (pub.get("cooldowns") or [{}])[0]
 check("cooldown entry has model+seconds",
       entry.get("model") == "hy4-preview" and entry.get("seconds") > 0, entry)
+
+print()
+print("[5] preset aliases are preserved for upstream routing")
+check("fast preset passes through", P.resolve_preset_model("fast-model") == "fast-model")
+check("balanced preset passes through", P.resolve_preset_model("balanced-model") == "balanced-model")
+check("deep preset passes through", P.resolve_preset_model("deep-model") == "deep-model")
+check("normal model passes through", P.resolve_preset_model("hy3") == "hy3")
+check("preset keeps requested id in usage", P.usage_model_label("fast-model", "hy3") == "fast-model")
 
 print()
 print("PASS=%d FAIL=%d" % (PASS, FAIL))

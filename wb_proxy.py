@@ -234,10 +234,13 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
     fields = _extract_usage(usage)
     if not fields:
         return None
+    requested_model = model or "unknown"
+    resolved_model = resolve_preset_model(requested_model)
     row = {
         "at": time.time(),
         "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "model": model,
+        "model": usage_model_label(requested_model, resolved_model),
+        "resolved_model": resolved_model,
         "stream": bool(stream),
         "elapsed_ms": elapsed_ms,
         "ttft_ms": ttft_ms,
@@ -273,7 +276,7 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
         if elapsed_ms is not None:
             _usage["wall_ms_sum"] += elapsed_ms
             _usage["wall_samples"] += 1
-        per = _usage["by_model"].setdefault(model, {"requests": 0, **{k: 0 for k in USAGE_FIELDS}})
+        per = _usage["by_model"].setdefault(requested_model, {"requests": 0, **{k: 0 for k in USAGE_FIELDS}})
         per["requests"] += 1
         for k in USAGE_FIELDS:
             if k in fields:
@@ -285,7 +288,7 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
         dur = f" {elapsed_ms:.0f}ms" if elapsed_ms is not None else ""
         acc_tag = f" acct={account[:8]}" if account else ""
         speed_tag = f" {row.get('tokens_per_sec', 0)}t/s" if row.get("tokens_per_sec") else ""
-        log(f"chat done: model={model}{acc_tag}{dur} tokens={t_tokens} (in={fields.get('prompt_tokens',0)} out={fields.get('completion_tokens',0)}){speed_tag}", tag="chat")
+        log(f"chat done: model={requested_model}{acc_tag}{dur} tokens={t_tokens} (in={fields.get('prompt_tokens',0)} out={fields.get('completion_tokens',0)}){speed_tag}", tag="chat")
     except Exception:
         pass
     return row
@@ -319,10 +322,12 @@ def _persist_usage(row, summary, fail_label):
 
 def record_error(model, status, message, elapsed_ms=None):
     """Count a failed request and append it to the log so errors are visible."""
+    requested_model = model or "unknown"
     row = {
         "at": time.time(),
         "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "model": model,
+        "model": usage_model_label(requested_model, resolve_preset_model(requested_model)),
+        "resolved_model": resolve_preset_model(requested_model),
         "error": True,
         "status": status,
         "message": str(message)[:200],
@@ -337,7 +342,7 @@ def record_error(model, status, message, elapsed_ms=None):
         summary = json.loads(json.dumps(_usage))
     _persist_usage(row, summary, "error persist failed")
     dur = f" {elapsed_ms:.0f}ms" if elapsed_ms is not None else ""
-    log(f"request error: model={model}{dur} status={status} msg={str(message)[:180]}", level="ERROR", tag="chat")
+    log(f"request error: model={requested_model}{dur} status={status} msg={str(message)[:180]}", level="ERROR", tag="chat")
     return row
 def _pct(values, q):
     """Nearest-rank percentile (no interpolation) - good enough for latency."""
@@ -915,17 +920,17 @@ def models_config_view():
     out = {}
     for realm in ("intl", "cn"):
         try:
-            entries = merge_catalog([], realm=realm)
-            if realm == "intl":
-                live = fetch_endpoint_models()
-                if live:
-                    entries = merge_catalog(live, realm=realm)
+            product = read_product_config_models(realm=realm)
+            live = fetch_endpoint_models(realm=realm)
+            entries = merge_catalog(product + (live or []), realm=realm)
         except Exception:
             entries = merge_catalog([], realm=realm)
-        pool_ids = [mid for mid, _ in entries if mid]
+        full_ids = [mid for mid, _ in entries if mid]
+        env_visible = [mid for mid, _ in wb_patch_pick(entries, realm) if mid]
         entry = cfg.get(realm) or {}
         out[realm] = {
-            "pool": pool_ids,
+            "pool": full_ids,
+            "visible": env_visible,
             "hidden": entry.get("hidden") or [],
             "order": entry.get("order") or [],
         }
@@ -1072,15 +1077,10 @@ def clear_logs():
 #: "lite" backs internal helpers (title generation, compaction) and upstream
 #: rejects it with 11102; the codewise/completion entries are text-completion
 #: or IDE-inline models, not chat models.
-# Exclude WorkBuddy virtual aliases / quick presets
-VIRTUAL_ALIAS_MODELS = {
-    "default-model",
-    "fast-model",
-    "balanced-model",
-    "primary-model",
-    "deep-model",
-}
-NON_CHAT_MODELS = {"lite"} | VIRTUAL_ALIAS_MODELS
+# Preset aliases are translated before forwarding, so they are chat-visible.
+PRESET_MODEL_ALIASES = ("fast-model", "balanced-model", "deep-model")
+EXCLUDED_MODELS = {"lite", "default-model", "primary-model"}
+NON_CHAT_MODELS = EXCLUDED_MODELS
 NON_CHAT_PREFIXES = ("codewise-", "completion-")
 NON_CHAT_SUFFIXES = ("-image-alpha", "-image-alpha-edit", "-taco-completion")
 def is_chat_model(mid):
@@ -1158,6 +1158,122 @@ def merge_catalog(primary, realm=None):
         if mid not in seen:
             out.append((mid, meta))
     return out
+
+
+def resolve_preset_model(model_id):
+    """Keep WorkBuddy's preset IDs intact for upstream routing.
+
+    The desktop catalog exposes fast/balanced/deep as first-class model IDs
+    with their own credits and capabilities. They are not aliases with a
+    documented concrete replacement, so guessing one would silently change
+    both the response and the billed multiplier. The helper remains the single
+    place a future upstream-provided mapping can be added.
+    """
+    return model_id
+
+
+def usage_model_label(requested, resolved):
+    """Keep the client-facing alias visible in usage rows."""
+    return requested or resolved
+
+
+def reconcile_model_sync(visible_ids, upstream_ids, realm):
+    """Return sync state that preserves user visibility choices.
+
+    Models that were filtered out by the current panel configuration are
+    hidden when a sync discovers them, while models already visible stay
+    visible. This prevents a sync from unexpectedly re-exposing the noise
+    that the user deliberately removed.
+    """
+    visible = {str(x) for x in (visible_ids or []) if x}
+    upstream = {str(x) for x in (upstream_ids or []) if x}
+    all_ids = set(upstream)
+    visible_out = set(visible) | set(PRESET_MODEL_ALIASES)
+    return {
+        "realm": realm,
+        "visible": sorted(visible_out),
+        "upstream": sorted(upstream),
+        "hidden": sorted(all_ids - visible_out),
+    }
+
+
+def sync_model_config(cfg, realm, filtered_entries, full_entries):
+    """Build and persist the state for one realm's model sync.
+
+    `filtered_entries` is what the current environment filter would expose
+    before panel hidden/order is applied; `full_entries` is the unfiltered
+    upstream/catalog pool. Models that the environment filter drops stay
+    hidden, while the three chat presets are exposed when present upstream.
+    """
+    entry = cfg.get(realm) or {}
+    visible_ids = [mid for mid, _ in (filtered_entries or []) if mid]
+    upstream_ids = [mid for mid, _ in (full_entries or []) if mid]
+    all_ids = [mid for mid, _ in (full_entries or []) if mid]
+    state = reconcile_model_sync(visible_ids, upstream_ids, realm)
+    previous_hidden = [str(x) for x in (entry.get("hidden") or []) if str(x).strip()]
+    # A preset is intentionally visible even when WB_MODEL_SET=official omits
+    # it, but an explicit manual hide must still win.
+    state["visible"] = set(state["visible"]) - set(previous_hidden)
+    hidden = sorted((set(all_ids) - set(state["visible"])) | set(previous_hidden))
+    state["visible"] = sorted(state["visible"])
+    # Keep the previous order for ids that still exist, then append newly
+    # discovered ids in upstream order. Sorting the result would undo the
+    # operator's manual ordering.
+    previous_order = [str(x) for x in (entry.get("order") or []) if str(x).strip()]
+    ordered = []
+    seen = set()
+    for mid in previous_order + all_ids:
+        if mid in seen or mid not in set(all_ids):
+            continue
+        seen.add(mid)
+        ordered.append(mid)
+    state["order"] = ordered
+    state["hidden"] = hidden
+    saved = wb_settings.set_model_config(ACCOUNTS_DIR, realm, hidden, state["order"])
+    return {
+        "realm": realm,
+        "visible": state["visible"],
+        "upstream": state["upstream"],
+        "hidden": hidden,
+        "order": state["order"],
+        "hidden_count": len(state["hidden"]),
+        "presets": [m for m in PRESET_MODEL_ALIASES if m in state["visible"]],
+        "saved": saved,
+    }
+
+
+def sync_models(realm=None):
+    """Force-refresh the upstream catalog and persist panel visibility choices."""
+    realm = (realm or CURRENT_REALM)
+    if realm not in ("intl", "cn"):
+        realm = CURRENT_REALM
+    # The public list must bypass the normal 300s cache: otherwise pressing
+    # "sync" repeatedly reports the same stale state.
+    with _lock:
+        _models_cache[realm] = {"at": 0.0, "data": None}
+    product = read_product_config_models(realm=realm)
+    endpoint = fetch_endpoint_models(realm=realm, force=True)
+    combined = product
+    if endpoint:
+        combined = product + endpoint
+    full = merge_catalog(combined, realm=realm)
+    env_visible = _wb_patch_pick_env(full, realm)
+    cfg = wb_settings.model_config(ACCOUNTS_DIR)
+    state = sync_model_config(cfg, realm, env_visible, full)
+    with _lock:
+        _models_cache[realm] = {"at": 0.0, "data": None}
+    return {
+        "ok": True,
+        "realm": realm,
+        "discovered": [mid for mid, _ in full if mid],
+        "endpoint_count": len(endpoint or []),
+        "presets": state["presets"],
+        "hidden": state["hidden"],
+        "order": state["order"],
+        "hidden_count": state["hidden_count"],
+        "saved": state["saved"],
+    }
+
 def _wb_patch_pick_env(entries, r):
     """# PATCH(wb-hub-curated-models) 精选模型列表：只暴露 WB_MODEL_PREFIXES 里的前缀。
 
@@ -1219,10 +1335,26 @@ def wb_patch_pick(entries, r):
     - order : 期望顺序；未列出的沿用原顺序追加在后
     面板未配置时行为与旧版完全一致（环境变量 WB_MODEL_SET / WB_MODEL_PREFIXES 仍然生效）。
     """
-    base = _wb_patch_pick_env(entries, r)
     cfg = wb_patch_model_config(r)
     hidden = set(cfg.get("hidden") or [])
     order = cfg.get("order") or []
+    # A manually saved order is also the operator's explicit allow-list. It
+    # lets a chat-visible preset survive WB_MODEL_SET=official even though the
+    # upstream "official" list only contains the stock desktop entries.
+    allowed = set(order)
+    if allowed:
+        index = {}
+        for mid, meta in entries:
+            if mid and mid not in index:
+                index[mid] = meta
+        base = [(mid, index[mid]) for mid in order if mid in index]
+        # Keep any newly discovered non-filtered models after the explicit
+        # entries. This preserves previous behavior for users who saved an
+        # order before the upstream added a model.
+        base += [(mid, meta) for mid, meta in _wb_patch_pick_env(entries, r)
+                 if mid not in allowed]
+    else:
+        base = _wb_patch_pick_env(entries, r)
     if not hidden and not order:
         return base
     out = [(mid, meta) for mid, meta in base if mid and mid not in hidden]
@@ -1314,11 +1446,17 @@ def wb_patch_key_fields():
     }
 
 
-def usage_by_key():
-    """# PATCH(wb-hub-usage-key) 按 API Key 聚合用量流水 —— 多租户场景下看「谁用了多少」。"""
+def usage_by_key(log_path=None, configured=None):
+    """Aggregate usage by API key.
+
+    Rows written before key instrumentation have no key_id/key_name and are
+    intentionally excluded: they belong to the historical account view, not
+    to any current API key.
+    """
     buckets = {}
+    path = log_path or USAGE_LOG
     try:
-        with open(USAGE_LOG, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
                 if not line:
@@ -1329,30 +1467,74 @@ def usage_by_key():
                     continue
                 kid = str(row.get("key_id") or "")
                 kname = str(row.get("key_name") or "")
-                token = kid or kname or "(埋点前)"
+                if not kid and not kname:
+                    continue
+                token = kid or kname
                 bucket = buckets.setdefault(token, {
                     "key_id": kid, "key_name": kname,
-                    "label": kname or kid or "(埋点前)",
+                    "label": kname or kid,
                     "requests": 0, "errors": 0, "prompt_tokens": 0,
-                    "completion_tokens": 0, "total_tokens": 0, "credit": 0.0,
+                    "completion_tokens": 0, "reasoning_tokens": 0,
+                    "cached_tokens": 0, "total_tokens": 0, "credit": 0.0,
+                    "ttft_ms_sum": 0.0, "ttft_n": 0,
+                    "speed_sum": 0.0, "speed_n": 0,
+                    "elapsed_ms_sum": 0.0, "elapsed_n": 0,
                     "models": {}, "accounts": {},
                 })
                 if row.get("error"):
                     bucket["errors"] += 1
                     continue
                 bucket["requests"] += 1
-                for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                for field in ("prompt_tokens", "completion_tokens", "reasoning_tokens",
+                              "cached_tokens", "total_tokens"):
                     bucket[field] += row.get(field) or 0
                 try:
                     bucket["credit"] += float(row.get("credit") or 0)
                 except (TypeError, ValueError):
                     pass
+                if row.get("ttft_ms") is not None:
+                    bucket["ttft_ms_sum"] += row.get("ttft_ms") or 0
+                    bucket["ttft_n"] += 1
+                if row.get("tokens_per_sec") is not None:
+                    bucket["speed_sum"] += row.get("tokens_per_sec") or 0
+                    bucket["speed_n"] += 1
+                if row.get("elapsed_ms") is not None:
+                    bucket["elapsed_ms_sum"] += row.get("elapsed_ms") or 0
+                    bucket["elapsed_n"] += 1
                 model = row.get("model") or "?"
                 bucket["models"][model] = bucket["models"].get(model, 0) + 1
                 acct = row.get("account") or "(unattributed)"
                 bucket["accounts"][acct] = bucket["accounts"].get(acct, 0) + 1
     except Exception as exc:
         log("usage_by_key failed: %s" % exc)
+    if configured:
+        for entry in configured:
+            kid = str(entry.get("id") or "")
+            kname = str(entry.get("name") or "")
+            token = kid or kname
+            if not token or token in buckets:
+                continue
+            buckets[token] = {
+                "key_id": kid, "key_name": kname,
+                "label": kname or kid,
+                "requests": 0, "errors": 0, "prompt_tokens": 0,
+                "completion_tokens": 0, "reasoning_tokens": 0,
+                "cached_tokens": 0, "total_tokens": 0, "credit": 0.0,
+                "ttft_ms_sum": 0.0, "ttft_n": 0,
+                "speed_sum": 0.0, "speed_n": 0,
+                "elapsed_ms_sum": 0.0, "elapsed_n": 0,
+                "models": {}, "accounts": {},
+            }
+    for bucket in buckets.values():
+        total = bucket["requests"] + bucket["errors"]
+        bucket["success_rate_pct"] = round(bucket["requests"] * 100.0 / total, 1) if total else 0.0
+        bucket["cache_hit_pct"] = round(bucket["cached_tokens"] * 100.0 / bucket["prompt_tokens"], 1) if bucket["prompt_tokens"] else 0.0
+        bucket["ttft_ms_avg"] = round(bucket["ttft_ms_sum"] / bucket["ttft_n"]) if bucket["ttft_n"] else 0
+        bucket["tokens_per_sec_avg"] = round(bucket["speed_sum"] / bucket["speed_n"], 1) if bucket["speed_n"] else 0.0
+        bucket["elapsed_ms_avg"] = round(bucket["elapsed_ms_sum"] / bucket["elapsed_n"]) if bucket["elapsed_n"] else 0
+        bucket.pop("ttft_ms_sum", None); bucket.pop("ttft_n", None)
+        bucket.pop("speed_sum", None); bucket.pop("speed_n", None)
+        bucket.pop("elapsed_ms_sum", None); bucket.pop("elapsed_n", None)
     return sorted(buckets.values(), key=lambda b: (-b["total_tokens"], -b["requests"]))
 
 
@@ -1486,23 +1668,7 @@ def read_product_config_models(realm=None):
             cfg = json.load(fh)
     except Exception as exc:
         return []
-    def find(node):
-        if isinstance(node, dict):
-            models = node.get("models")
-            if isinstance(models, list) and models and isinstance(models[0], dict) and models[0].get("id"):
-                return models
-            for value in node.values():
-                hit = find(value)
-                if hit:
-                    return hit
-        return None
-    models = find(cfg) or []
-    out = []
-    for m in models:
-        mid = m.get("id")
-        if isinstance(mid, str) and mid:
-            out.append((mid, m))
-    return out
+    return parse_product_config_models(cfg)
 # Upstream capability/metadata fields we care to forward from the personal
 # models endpoint so nothing has to be hard-coded locally (notably `credits`,
 # the live per-model multiplier shown on the dashboard).
@@ -1515,54 +1681,103 @@ UPSTREAM_MODEL_META_KEYS = (
 )
 
 
-def fetch_endpoint_models():
+def _merge_model_entry(out, seen, entry, keys=UPSTREAM_MODEL_META_KEYS):
+    """Append one model entry while preserving richer metadata."""
+    if isinstance(entry, dict):
+        mid = entry.get("id")
+        meta = {k: entry[k] for k in keys if k in entry}
+    else:
+        mid, meta = entry, {}
+    mid = str(mid or "").strip()
+    if not mid:
+        return
+    if mid not in seen:
+        seen.add(mid)
+        out.append((mid, meta))
+        return
+    for index, (known_id, known_meta) in enumerate(out):
+        if known_id != mid:
+            continue
+        merged = dict(known_meta or {})
+        merged.update(meta)
+        out[index] = (mid, merged)
+        return
+
+
+def parse_endpoint_model_payload(payload):
+    """Merge both model sources returned by the upstream model endpoint.
+
+    `data.models` is the rich catalog (credits/capabilities), while
+    `data.agents[].models` also carries the agent presets and may include
+    entries that are absent from the root list. Keep both instead of returning
+    early on the first non-empty source.
+    """
+    data = (payload or {}).get("data") or {}
+    out, seen = [], set()
+    rich = data.get("models")
+    if isinstance(rich, list):
+        for entry in rich:
+            _merge_model_entry(out, seen, entry)
+    for agent in data.get("agents") or []:
+        if not isinstance(agent, dict):
+            continue
+        for entry in agent.get("models") or []:
+            _merge_model_entry(out, seen, entry)
+    return out
+
+
+def parse_product_config_models(cfg):
+    """Merge root `models` and `agents[].models` from the desktop cache.
+
+    Both root and agent entries can be rich dictionaries. They are merged
+    recursively at the top level so a later agent entry can fill in a missing
+    preset without dropping its root credits or capabilities.
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    out, seen = [], set()
+    root = cfg.get("models")
+    if isinstance(root, list):
+        for entry in root:
+            _merge_model_entry(out, seen, entry)
+    for agent in cfg.get("agents") or []:
+        if not isinstance(agent, dict):
+            continue
+        for entry in agent.get("models") or []:
+            _merge_model_entry(out, seen, entry)
+    return out
+
+
+def fetch_endpoint_models(realm=None, force=False):
     """Live model list from upstream: [(id, meta), ...].
 
     `meta` carries the upstream-provided metadata (including `credits`, the
     live multiplier) so the dashboard shows the real upstream rate instead of
     a hard-coded copy. Falls back to the in-memory cache when unavailable.
+    `force=True` bypasses the normal model cache and is used by the panel sync
+    endpoint.
     """
-    account = POOL.pick(realm="intl") if POOL else None
+    r = realm or CURRENT_REALM
+    if not force:
+        with _lock:
+            cached = _models_cache.get(r) or {}
+            if cached.get("data") and time.time() - cached.get("at", 0.0) < 300:
+                return list(cached.get("data") or [])
+    account = POOL.pick(realm=r) if POOL else None
     if account is None:
         log("model discovery skipped: no usable account")
-        cached = _models_cache.get("intl", {}).get("data")
+        cached = _models_cache.get(r, {}).get("data")
         return list(cached or [])
-    req = urllib.request.Request(UPSTREAM + MODELS_PATH, method="GET", headers=account.headers())
+    cfg = wb_accounts.get_realm_config(account.realm)
+    url = cfg["chat_upstream"] + MODELS_PATH
+    req = urllib.request.Request(url, method="GET", headers=account.headers())
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except Exception as exc:
         log(f"model discovery failed: {exc}")
-        cached = _models_cache.get("intl", {}).get("data")
+        cached = _models_cache.get(r, {}).get("data")
         return list(cached or [])
-    data = payload.get("data") or {}
-    out, seen = [], set()
-
-    def _add(entry):
-        if isinstance(entry, dict):
-            mid = entry.get("id")
-            meta = {k: entry[k] for k in UPSTREAM_MODEL_META_KEYS if k in entry}
-        else:
-            mid, meta = entry, {}
-        if not mid or mid in seen:
-            return
-        seen.add(mid)
-        out.append((mid, meta))
-
-    # Preferred: data.models is a rich list of dicts carrying `credits`
-    # (the live multiplier) plus full capability metadata.
-    rich = data.get("models")
-    if isinstance(rich, list):
-        for entry in rich:
-            _add(entry)
-        if out:
-            return out
-
-    # Fallback: data.agents[].models (usually just model-id strings).
-    for agent in data.get("agents") or []:
-        for entry in agent.get("models") or []:
-            _add(entry)
-    return out
+    return parse_endpoint_model_payload(payload)
 def strip_data_prefix(line):
     line = line.strip()
     # SSE comment / heartbeat / keepalive / empty line
@@ -1884,7 +2099,7 @@ def translate_max_completion_tokens(obj):
     except (TypeError, ValueError):
         pass
 def build_upstream_body(payload):
-    model = payload.get("model") or ""
+    model = resolve_preset_model(payload.get("model") or "")
     messages = normalize_roles(payload.get("messages") or [])
     messages = sanitize_messages(messages)
     messages = backfill_reasoning_content(messages, model)
@@ -1904,9 +2119,13 @@ def build_upstream_body(payload):
         body["stream_options"] = {"include_usage": True}
     return body
 def open_upstream(payload, session_key=None, target_realm=None, allow=None):
-    model = payload.get("model") or ""
-    realm = target_realm or detect_model_realm(payload.get("model")) or CURRENT_REALM
-    upstream_body = build_upstream_body(payload)
+    requested_model = payload.get("model") or ""
+    model = resolve_preset_model(requested_model)
+    upstream_payload = dict(payload)
+    if model != requested_model:
+        upstream_payload["model"] = model
+    realm = target_realm or detect_model_realm(model) or CURRENT_REALM
+    upstream_body = build_upstream_body(upstream_payload)
     body = json.dumps(upstream_body, ensure_ascii=False).encode("utf-8")
     # PATCHED-BY-OPS: 客户端未提供会话标识时，用对话稳定前缀兜底。
     # 位置放在 build_upstream_body 之后，保证键与真正发往上游的消息一致
@@ -1947,7 +2166,7 @@ def open_upstream(payload, session_key=None, target_realm=None, allow=None):
         try:
             resp = urllib.request.urlopen(req, timeout=600)
             # 成功：清掉这个模型的冷却（其它模型的冷却保留），并解除账号级冷却
-            account.clear_error(model=model)
+            account.clear_error(model=requested_model)
             return resp, account
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403, 429):
@@ -1958,7 +2177,7 @@ def open_upstream(payload, session_key=None, target_realm=None, allow=None):
                 # 401/403 = 账号/令牌问题：整个账号冷却。
                 account.note_error("HTTP %s" % exc.code,
                                    cooldown=300 if exc.code == 429 else 60,
-                                   single_account=(total <= 1), model=model,
+                                   single_account=(total <= 1), model=requested_model,
                                    account_wide=(exc.code != 429))
                 last_error = exc
                 continue
@@ -1966,7 +2185,7 @@ def open_upstream(payload, session_key=None, target_realm=None, allow=None):
         except Exception as exc:
             if session_key and POOL:
                 POOL.affinity.unbind(session_key)
-            account.note_error(str(exc)[:120], cooldown=60, single_account=(total <= 1), model=model, account_wide=True)
+            account.note_error(str(exc)[:120], cooldown=60, single_account=(total <= 1), model=requested_model, account_wide=True)
             last_error = exc
             continue
     if last_error is not None:
@@ -3065,7 +3284,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/usage/by-key":
             if not self._authorized():
                 return
-            return self._json(200, {"keys": usage_by_key()})
+            return self._json(200, {"keys": usage_by_key(configured=configured_keys())})
         if path == "/usage/recent":
             if not self._authorized():
                 return
@@ -3741,6 +3960,18 @@ class Handler(BaseHTTPRequestHandler):
             if not self._panel_ok():
                 return self._error(401, "panel password required", "invalid_request_error")
             return self._handle_settings_save()
+        if path == "/models/sync":
+            if not self._panel_ok():
+                return self._error(401, "panel password required", "invalid_request_error")
+            payload = self._payload_or_error()
+            if payload is None:
+                return
+            realm = str(payload.get("realm") or CURRENT_REALM).strip().lower()
+            try:
+                return self._json(200, sync_models(realm=realm))
+            except Exception as exc:
+                return self._error(502, "model sync failed: %s" % exc,
+                                   "upstream_error")
         if path in ("/panel/login", "/panel/logout", "/panel/password"):
             return self._handle_panel(path)
         if self._is_panel_route(path) and not self._panel_ok():
