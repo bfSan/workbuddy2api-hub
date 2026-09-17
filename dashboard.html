@@ -1,4 +1,5 @@
 <!doctype html>
+<!-- PATCH(wb-hub-dashboard-buttons) -->
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -274,7 +275,7 @@ a:hover{text-decoration:underline}
     <button class="sec" id="btnScanDesktop" onclick="scanDesktop(this)">扫描桌面客户端账号</button>
     <button class="sec" onclick="exportAccounts(this)">导出账号</button>
     <button class="sec" onclick="openImport()">导入账号</button>
-    <button class="sec" onclick="fetchCredits(this)">刷新额度/积分</button>
+    <button class="sec" onclick="queryCredits(this)">刷新额度/积分</button>
     <button class="sec" onclick="setAll(true, this)">全部启用</button>
     <button class="sec" onclick="setAll(false, this)">全部停用</button>
     
@@ -324,6 +325,7 @@ a:hover{text-decoration:underline}
         <select id="growthAcctSelect" onchange="switchGrowthAccount(this.value)" style="background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:6px 10px;font-size:12px;color:var(--fg);font-family:inherit">
           <option value="all">全部国内账号 (批量)</option>
         </select>
+        <select id="taskAccountSel" onchange="onTaskAccountChange(this.value)" title="选择要执行任务的账号" style="padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:var(--panel);color:var(--text)"></select>
         <button class="primary" id="btnRunTasks" onclick="runGrowthTasks(this)">一键做任务领积分</button>
         <button id="btnCatTravel" onclick="triggerCatTravel(this)">猫猫旅行</button>
       </div>
@@ -695,7 +697,7 @@ async function pollLogin(){
     if(statusBox) statusBox.textContent = r.message || r.status;
     if(r.status === "ok"){
       if(s3) s3.className = "step done";
-      if(statusBox) statusBox.textContent = "登录成功：" + (r.account && r.account.nickname) + " 已加入账号池";
+      if(statusBox) statusBox.textContent = "登录成功：" + accName(r.account) + " 已加入账号池";
       if(loginTimer){ clearInterval(loginTimer); loginTimer = null; }
       loginState = null;
       await loadAccounts();
@@ -872,6 +874,121 @@ async function switchGrowthAccount(uid){
   await loadGrowthTasks();
 }
 
+/* 账号别名：面板上账号默认显示上游昵称，不好辨认，允许自定义 */
+window.ACCOUNT_ALIASES = window.ACCOUNT_ALIASES || {};
+
+function accAlias(uid){
+  if(!uid) return '';
+  return (window.ACCOUNT_ALIASES || {})[uid] || '';
+}
+
+function accName(a){
+  if(!a) return '';
+  if(a.alias) return a.alias;
+  const byUid = accAlias(a.uid);
+  if(byUid) return byUid;
+  return a.nickname || (a.uid ? String(a.uid).slice(0, 8) : '');
+}
+
+async function editAccountAlias(uid, current){
+  const input = prompt('给这个账号起个别名（留空则恢复默认显示）：', current || '');
+  if(input === null) return;
+  const value = String(input).trim();
+  const map = Object.assign({}, window.ACCOUNT_ALIASES || {});
+  if(value) map[uid] = value; else delete map[uid];
+  try{
+    await postJSON('/settings/save', {account_aliases: map});
+    window.ACCOUNT_ALIASES = map;
+    await loadAccounts();
+    if(typeof loadSettings === 'function') loadSettings(false);
+    toast('别名已保存', 'ok');
+  }catch(e){
+    toast('保存失败: ' + e.message, 'bad');
+  }
+}
+
+/* 任务页：可以只对某个账号做任务，不选则依次跑所有国内号 */
+window.TASK_UID = '';
+
+function taskAccountOptions(){
+  return (window.ACCOUNTS || []).filter(function(a){ return a.realm === 'cn'; });
+}
+
+function renderTaskAccountSel(){
+  const sel = document.getElementById('taskAccountSel');
+  if(!sel) return;
+  const list = taskAccountOptions();
+  if(window.TASK_UID && !list.some(function(a){ return a.uid === window.TASK_UID; })){
+    window.TASK_UID = '';
+  }
+  sel.innerHTML = '<option value="">全部账号（依次执行）</option>' + list.map(function(a){
+    return '<option value="' + esc(a.uid) + '"'
+      + (a.uid === window.TASK_UID ? ' selected' : '') + '>' + esc(accName(a)) + '</option>';
+  }).join('');
+}
+
+function onTaskAccountChange(value){
+  window.TASK_UID = value || '';
+  loadGrowthTasks();
+}
+
+function taskUid(){ return window.TASK_UID || ''; }
+
+/* 按 API Key 的用量（多租户出账） */
+function keyUsageContainer(){
+  var box = document.getElementById('keyUsageSection');
+  if(box) return box;
+  var host = document.getElementById('pageAnalytics');
+  if(!host) return null;
+  box = document.createElement('section');
+  box.id = 'keyUsageSection';
+  box.innerHTML = '<h2 style="margin:0 0 10px">按 API Key 用量</h2>'
+    + '<div id="keyUsageBody" class="hint">加载中</div>';
+  host.appendChild(box);
+  return box;
+}
+
+async function loadKeyUsage(){
+  var box = keyUsageContainer();
+  if(!box) return;
+  var body = document.getElementById('keyUsageBody');
+  if(!body) return;
+  try{
+    var r = await getJSON('/usage/by-key');
+    var rows = r.keys || [];
+    if(!rows.length){
+      body.innerHTML = '<p class="hint">暂无 Key 维度记录。埋点之前的流水无法回填，新请求会开始统计。</p>';
+      return;
+    }
+    body.innerHTML = '<table class="tbl"><thead><tr>'
+      + '<th>API Key</th><th>请求</th><th>失败</th><th>tokens</th><th>积分</th><th>命中账号</th>'
+      + '</tr></thead><tbody>'
+      + rows.map(function(k){
+          var models = Object.keys(k.models || {}).slice(0, 3).join('、');
+          var accts = Object.keys(k.accounts || {}).map(function(u){
+            return (accName({uid: u}) || String(u).slice(0, 8)) + ' (' + k.accounts[u] + ')';
+          }).join('、') || '-';
+          return '<tr>'
+            + '<td><b>' + esc(k.label || '(未命名)') + '</b>'
+            + (k.key_id ? ' <span class="mono" style="color:var(--dim);font-size:11px">' + esc(k.key_id) + '</span>' : '')
+            + (models ? '<div class="mono" style="font-size:11px;color:var(--dim)">' + esc(models) + '</div>' : '')
+            + '</td>'
+            + '<td>' + fmt(k.requests) + '</td>'
+            + '<td>' + (k.errors ? '<span style="color:var(--warn)">' + k.errors + '</span>' : '0') + '</td>'
+            + '<td>' + fmt(k.total_tokens) + '</td>'
+            + '<td><b style="color:var(--accent2)">' + (k.credit || 0).toFixed(2) + '</b></td>'
+            + '<td style="font-size:12px">' + esc(accts) + '</td>'
+            + '</tr>';
+        }).join('')
+      + '</tbody></table>';
+  }catch(e){
+    body.innerHTML = '<p class="hint" style="color:var(--warn)">读取失败: ' + esc(e.message) + '</p>';
+  }
+}
+
+setTimeout(loadKeyUsage, 1500);
+setInterval(loadKeyUsage, 30000);
+
 async function loadGrowthTasks(){
   const sec = document.getElementById("sectionGrowthTasks");
   if(!sec) return;
@@ -880,6 +997,7 @@ async function loadGrowthTasks(){
     return;
   }
   sec.style.display = 'block';
+  renderTaskAccountSel();
   try{
     const q = (CURRENT_GROWTH_UID && CURRENT_GROWTH_UID !== 'all') ? ('?uid=' + encodeURIComponent(CURRENT_GROWTH_UID)) : '';
     const r = await getJSON('/tasks' + q);
@@ -893,7 +1011,7 @@ async function loadGrowthTasks(){
     const sel = document.getElementById("growthAcctSelect");
     if(sel && accts.length){
       const opts = ['<option value="all"' + (CURRENT_GROWTH_UID === 'all' ? ' selected' : '') + '>全部国内账号 (批量)</option>']
-        .concat(accts.map(a => '<option value="' + esc(a.uid) + '"' + (CURRENT_GROWTH_UID === a.uid ? ' selected' : '') + '>' + esc(a.nickname) + ' (' + esc(a.uid.slice(0,6)) + ')</option>'))
+        .concat(accts.map(a => '<option value="' + esc(a.uid) + '"' + (CURRENT_GROWTH_UID === a.uid ? ' selected' : '') + '>' + esc(accName(a)) + ' (' + esc(a.uid.slice(0,6)) + ')</option>'))
         .join('');
       sel.innerHTML = opts;
     }
@@ -1066,7 +1184,7 @@ async function doCheckin(btn){
     const res = r.results || [];
     if(!res.length) toast("未发现国内版账号", "warn");
     else {
-      const summary = res.map(x => (x.nickname||x.uid.slice(0,6)) + ": " + (x.ok ? "签到成功" : (x.error||x.msg))).join("；");
+      const summary = res.map(x => accName(x) + ": " + (x.ok ? "签到成功" : (x.error||x.msg))).join("；");
       toast("每日签到: " + summary, res.some(x => x.ok) ? "ok" : "warn");
     }
     await initRealm(); loadAccounts(); loadModels();
@@ -1193,7 +1311,7 @@ function accountRow(a){
   return '<tr>'
     + '<td style="text-align:center;white-space:nowrap">' + realmBadge + '</td>'
     + '<td style="text-align:left">'
-    +   '<div style="font-weight:600;font-size:13px;color:var(--fg)">' + esc(a.nickname) + '</div>'
+    +   '<div style="font-weight:600;font-size:13px;color:var(--fg)">' + esc(accName(a)) + '</div>'
     + '<div class="mono" style="color:var(--dim);font-size:11px">' + esc(a.uid.slice(0,8)) + ' · ' + esc(a.source) + ' · 到期 ' + esc(a.expiresIn || '?') + '</div>'
     + (a.machineId ? ('<div class="mono" style="color:var(--dim);font-size:10px;margin-top:2px" title="由账号UID稳定派生的专属设备码，防多号关联风控">设备码: ' + esc(a.machineId.slice(0,14)) + '...</div>') : '')
     + err + '</td>'
@@ -1224,7 +1342,7 @@ function renderAccounts(){
       + '<div style="color:var(--dim);font-size:13px;margin-bottom:18px">'
       +   '请先登录一个 WorkBuddy 账号，之后所有请求都会走这个账号'
       + '</div>'
-      + '<button onclick="startLogin()" style="font-size:14px;padding:10px 22px">'
+      + '<button onclick="openLoginModal()" style="font-size:14px;padding:10px 22px">'
       +   '登录新账号'
       + '</button>'
       + '<div style="color:var(--dim);font-size:12px;margin-top:16px;line-height:1.9">'
@@ -1589,7 +1707,7 @@ function renderDesktopScan(list){
           + ' data-path="' + esc(d.path) + '"'
           + ' data-realm="' + esc(d.realm) + '">导入</button>';
       html += '<tr>'
-        + '<td><b>' + esc(d.nickname || (d.uid||'').slice(0,8)) + '</b>'
+        + '<td><b>' + esc(accName(d)) + '</b>'
         + '<div class="mono" style="font-size:11px;color:var(--dim)">' + esc((d.uid||'').slice(0,8)) + ' · ' + esc(d.file) + '</div></td>'
         + '<td class="mono" style="font-size:11px">' + esc(d.domain || '-') + '</td>'
         + '<td>' + esc(d.expiresIn || '未知') + '</td>'
@@ -1629,7 +1747,7 @@ async function doImportDesktop(btn, path, realm){
     try{
     const r = await postJSON('/accounts/import/desktop', {path: path, realm: realm});
     const a = (r.imported || [])[0] || {};
-    toast('已导入 ' + (a.nickname || (a.uid||'').slice(0,8)) + ' 到 ' + (a.realm === 'cn' ? '国内版' : '国际版'));
+    toast('已导入 ' + accName(a) + ' 到 ' + (a.realm === 'cn' ? '国内版' : '国际版'));
     if(a.uid && window.SCAN_POOL) window.SCAN_POOL.add(a.uid);
     await loadAccounts();
     await refresh();
@@ -1773,13 +1891,13 @@ async function refreshInner(){
       if(acctEntries.length === 1){
         const [uid, count] = acctEntries[0];
         const info = acctsMap[uid] || {};
-        const name = esc(info.nickname || uid.slice(0, 8));
+        const name = esc(accName(info));
         const flag = info.realm === 'cn' ? '<span class="badge warn mini">🇨🇳</span>' : '<span class="badge s mini">🌐</span>';
         acctCell = '<b>' + name + '</b> ' + flag;
       } else if(acctEntries.length > 1){
         acctCell = acctEntries.map(([uid, count]) => {
           const info = acctsMap[uid] || {};
-          const name = esc(info.nickname || uid.slice(0, 6));
+          const name = esc(accName(info));
           const flag = info.realm === 'cn' ? '' : '';
           return '<span class="badge mini" style="margin:1px 2px">' + flag + ' ' + name + ' <span style="color:var(--dim)">(' + count + ')</span></span>';
         }).join('');
@@ -1981,7 +2099,10 @@ async function loadSettings(showToast){
       masked: k.masked || '',
       realm: k.realm || '',
       enabled: k.enabled !== false,
+      accounts: k.accounts || [],
     }));
+    window.ACCOUNT_OPTIONS = data.account_options || [];
+    window.ACCOUNT_ALIASES = data.account_aliases || {};
     renderKeyRows();
     const set = (id, value) => { const el = document.getElementById(id); if(el) el.textContent = value || '-'; };
     set('setVersion', data.version);
@@ -2035,6 +2156,157 @@ const REALM_CHOICES = [
   ['cn', '固定国内版出口'],
 ];
 
+function keyAccountChips(index, row){
+  const opts = (window.ACCOUNT_OPTIONS && window.ACCOUNT_OPTIONS.length)
+    ? window.ACCOUNT_OPTIONS : (window.ACCOUNTS || []);
+  const picked = new Set(row.accounts || []);
+  if(!opts.length){
+    return '<div style="width:100%;font-size:12px;color:var(--dim)">还没有可选账号，先到账号页登录</div>';
+  }
+  const chips = opts.map(o => {
+    const uid = o.uid || '';
+    const label = accName(o) + (o.realm ? ' · ' + o.realm : '');
+    return '<label style="display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--fg);'
+      + 'background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:4px 10px;cursor:pointer">'
+      + '<input type="checkbox"' + (picked.has(uid) ? ' checked' : '')
+      + ` onchange="toggleKeyAccount(${index}, '${uid}', this.checked)">`
+      + esc(label) + '</label>';
+  }).join('');
+  return '<div style="width:100%;display:flex;gap:6px;flex-wrap:wrap;align-items:center">'
+    + '<span style="font-size:12px;color:var(--dim)">限定账号</span>' + chips
+    + '<span style="font-size:11px;color:var(--dim)">都不选 = 不限，可用全部账号</span></div>';
+}
+
+function toggleKeyAccount(index, uid, checked){
+  const row = API_KEY_ROWS[index];
+  if(!row) return;
+  const picked = new Set(row.accounts || []);
+  if(checked) picked.add(uid); else picked.delete(uid);
+  row.accounts = Array.from(picked);
+  renderKeyRows();
+}
+
+/* Key 账号白名单：下拉多选 + 搜索 */
+var KEY_ACCT_UI = { open: -1, filter: '' };
+
+function keyAccountOptions(){
+  return (window.ACCOUNT_OPTIONS && window.ACCOUNT_OPTIONS.length)
+    ? window.ACCOUNT_OPTIONS : (window.ACCOUNTS || []);
+}
+
+function keyAccountPicked(index){
+  var row = API_KEY_ROWS[index] || {};
+  return new Set(row.accounts || []);
+}
+
+function keyAccountSummary(index){
+  var picked = keyAccountPicked(index);
+  if(!picked.size) return '不限（全部账号）';
+  var names = keyAccountOptions().filter(function(o){ return picked.has(o.uid || ''); })
+    .map(function(o){ return accName(o); });
+  if(names.length <= 2) return names.join('、');
+  return names[0] + ' 等 ' + names.length + ' 个';
+}
+
+function keyAccountListHtml(index){
+  var q = String(KEY_ACCT_UI.filter || '').toLowerCase();
+  var picked = keyAccountPicked(index);
+  var opts = keyAccountOptions().filter(function(o){
+    if(!q) return true;
+    var hay = ((o.nickname || '') + ' ' + (o.alias || '') + ' ' + accAlias(o.uid) + ' ' + (o.uid || '') + ' ' + (o.realm || '')).toLowerCase();
+    return hay.indexOf(q) >= 0;
+  });
+  if(!opts.length){
+    return '<div style="padding:8px 10px;font-size:12px;color:var(--dim)">没有匹配的账号</div>';
+  }
+  return opts.map(function(o){
+    var uid = String(o.uid || '');
+    var label = (o.nickname || uid.slice(0, 8)) + (o.realm ? ' · ' + o.realm : '');
+    return '<label style="display:flex;align-items:center;gap:8px;padding:6px 10px;font-size:12px;cursor:pointer">'
+      + '<input type="checkbox"' + (picked.has(uid) ? ' checked' : '')
+      + ` onchange="toggleKeyAccount(${index}, '${uid}', this.checked)">`
+      + '<span>' + esc(label) + '</span></label>';
+  }).join('');
+}
+
+function keyAccountDropdown(index, row){
+  var opts = keyAccountOptions();
+  if(!opts.length){
+    return '<div style="width:100%;font-size:12px;color:var(--dim)">还没有可选账号，先到账号页登录</div>';
+  }
+  var open = KEY_ACCT_UI.open === index;
+  return '<div class="kac-wrap" style="position:relative;width:100%">'
+    + '<button type="button" onclick="event.stopPropagation();toggleKeyAccountPanel(' + index + ')"'
+    + ' style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--fg);'
+    + ' background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:5px 10px;cursor:pointer">'
+    + '<span style="color:var(--dim)">限定账号</span>'
+    + '<span id="kac-sum-' + index + '">' + esc(keyAccountSummary(index)) + '</span>'
+    + '<span>▾</span></button>'
+    + '<div id="kac-panel-' + index + '" onclick="event.stopPropagation()"'
+    + ' style="display:' + (open ? 'block' : 'none') + ';position:absolute;z-index:80;left:0;top:calc(100% + 4px);'
+    + ' min-width:280px;background:var(--panel);border:1px solid var(--line);border-radius:10px;'
+    + ' box-shadow:0 8px 24px rgba(0,0,0,.18);padding:6px">'
+    + '<input id="kac-q-' + index + '" type="text" placeholder="搜索账号名 / uid"'
+    + ' value="' + esc(KEY_ACCT_UI.filter || '') + '"'
+    + ' oninput="filterKeyAccounts(' + index + ', this.value)"'
+    + ' style="width:100%;box-sizing:border-box;font-size:12px;padding:5px 8px;margin-bottom:4px;'
+    + ' border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)">'
+    + '<div id="kac-list-' + index + '" style="max-height:220px;overflow:auto">'
+    + keyAccountListHtml(index) + '</div>'
+    + '<div style="display:flex;gap:12px;align-items:center;padding:6px 10px 2px;font-size:11px;'
+    + ' border-top:1px solid var(--line);margin-top:4px;color:var(--dim)">'
+    + '<a href="javascript:void(0)" onclick="pickAllKeyAccounts(' + index + ', true)" style="color:var(--dim)">全选</a>'
+    + '<a href="javascript:void(0)" onclick="pickAllKeyAccounts(' + index + ', false)" style="color:var(--dim)">清空</a>'
+    + '<span style="margin-left:auto">清空 = 不限</span></div>'
+    + '</div></div>';
+}
+
+function toggleKeyAccountPanel(index){
+  KEY_ACCT_UI.open = (KEY_ACCT_UI.open === index) ? -1 : index;
+  KEY_ACCT_UI.filter = '';
+  renderKeyRows();
+  if(KEY_ACCT_UI.open === index){
+    var q = document.getElementById('kac-q-' + index);
+    if(q) q.focus();
+  }
+}
+
+function filterKeyAccounts(index, val){
+  KEY_ACCT_UI.filter = val || '';
+  var box = document.getElementById('kac-list-' + index);
+  if(box) box.innerHTML = keyAccountListHtml(index);
+}
+
+function toggleKeyAccount(index, uid, checked){
+  var row = API_KEY_ROWS[index];
+  if(!row) return;
+  var picked = new Set(row.accounts || []);
+  if(checked) picked.add(uid); else picked.delete(uid);
+  row.accounts = Array.from(picked);
+  var sum = document.getElementById('kac-sum-' + index);
+  if(sum) sum.textContent = keyAccountSummary(index);
+}
+
+function pickAllKeyAccounts(index, all){
+  var row = API_KEY_ROWS[index];
+  if(!row) return;
+  row.accounts = all
+    ? keyAccountOptions().map(function(o){ return String(o.uid || ''); }).filter(Boolean)
+    : [];
+  var box = document.getElementById('kac-list-' + index);
+  if(box) box.innerHTML = keyAccountListHtml(index);
+  var sum = document.getElementById('kac-sum-' + index);
+  if(sum) sum.textContent = keyAccountSummary(index);
+}
+
+document.addEventListener('click', function(){
+  if(KEY_ACCT_UI.open !== -1){
+    KEY_ACCT_UI.open = -1;
+    KEY_ACCT_UI.filter = '';
+    renderKeyRows();
+  }
+});
+
 function renderKeyRows(){
   const box = document.getElementById('keyList');
   if(!box) return;
@@ -2065,6 +2337,7 @@ function renderKeyRows(){
       +   '<input type="checkbox"' + (row.enabled ? ' checked' : '') + ' onchange="updateKeyRow(' + i + ',\'enabled\', this.checked)">启用</label>'
       + '<button class="sec mini" onclick="generateKeyRow(' + i + ')">随机生成</button>'
       + '<button class="danger mini" onclick="removeKeyRow(' + i + ')">删除</button>'
+      + keyAccountDropdown(i, row)
       + maskedHint
       + '</div>';
   }).join('');
@@ -2147,6 +2420,7 @@ async function saveApiKeys(btn){
     enabled: row.enabled !== false,
     // Blank means "keep the stored key", which the server honours per row.
     key: (row.key || '').trim(),
+    accounts: (row.accounts || []).slice(),
   }));
   const newRow = API_KEY_ROWS.find(row => !row.masked && !(row.key || '').trim());
   if(newRow){
@@ -2563,7 +2837,7 @@ function renderAnalytics(data){
 
         return '<tr>'
           + '<td style="text-align:left">'
-          +   '<b>' + esc(a.nickname || a.uid) + '</b>'
+          +   '<b>' + esc(accName(a)) + '</b>'
           +   '<div style="color:var(--dim);font-size:11px;font-family:monospace">' + esc((a.uid || '').slice(0, 10)) + '...</div>'
           + '</td>'
           + '<td>' + realmBadge + '</td>'
