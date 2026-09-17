@@ -88,6 +88,41 @@ docker run -d   --name wb-proxy   --restart unless-stopped   -p 8788:8788   -v $
 - **持久化目录**：`./accounts` (账号凭证及活动区域) 与 `./usage` (请求流水与指标快照)；
 - **配置参数**：通过环境变量 `API_KEY`、`PORT` 自定义。
 
+### 6. 本地打包与生产部署（推荐）
+
+生产环境采用「本地构建镜像，服务器只部署」的方式。服务器上不再直接拉取源码或执行构建，账号与用量数据始终留在服务器的持久化目录中。
+
+本机先执行打包：
+
+```bash
+scripts/package-image.sh
+```
+
+脚本会依次运行回归测试、构建 `linux/arm64` 镜像，并输出：
+
+- `dist/workbuddy2api-hub-linux-arm64.tar.gz`：可直接加载的镜像归档；
+- `dist/workbuddy2api-hub-linux-arm64.metadata.json`：镜像 ID、SHA256、Git commit 与构建时间。
+
+打包脚本默认使用 `mirror.gcr.io/library/python:3.11-alpine`，避免 Docker Hub 在某些网络环境下不可达。需要严格使用官方镜像时，可覆盖为：
+
+```bash
+BASE_IMAGE=python:3.11-alpine scripts/package-image.sh
+```
+
+基础镜像只参与本机构建，最终部署使用导出的完整镜像归档，因此生产服务器不需要访问该镜像源。
+
+打包脚本首次运行时会自动在仓库根目录创建 `.venv`，后续测试与打包命令都在这个虚拟环境中执行。项目运行本身仍然只依赖 Python 标准库，`requirements-packaging.txt` 目前只用于固定后续打包工具链的入口。
+
+部署到生产 Podman 主机：
+
+```bash
+scripts/deploy-production.sh
+```
+
+默认目标为 `yunxing@10.88.86.106`，远端 Podman 路径为 `/opt/podman/bin/podman`，容器名为 `wb-proxy`。部署脚本会保留 `accounts`、`usage` 和模型缓存挂载，只有新容器通过 `/health` 与面板模型接口校验后才算成功；如果启动或校验失败，会自动用旧镜像回滚。
+
+首次在新机器上部署时，可复制 `scripts/deploy-production.sh` 顶部的环境变量说明，创建 `~/.config/workbuddy2api-hub/deploy.env` 覆盖 `REMOTE_HOST`、`REMOTE_USER`、`REMOTE_BASE` 或 `IMAGE`。SSH 密码不会写入仓库，可通过 `SSH_PASSWORD_FILE` 指向本机密码文件；未设置时会兼容读取 `/tmp/sshpw`。
+
 ---
 
 ## 二、核心特性详解

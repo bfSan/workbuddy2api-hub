@@ -1,5 +1,6 @@
 # WorkBuddy Multi-Account Reverse Proxy Gateway
-FROM python:3.11-alpine
+ARG BASE_IMAGE=python:3.11-alpine
+FROM ${BASE_IMAGE}
 
 # Set environment
 ENV PYTHONUNBUFFERED=1     HOST=0.0.0.0     PORT=8788     API_KEY=     TZ=Asia/Shanghai

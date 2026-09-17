@@ -1,0 +1,5 @@
+# Runtime dependencies for WorkBuddy2API-Hub are intentionally empty:
+# the gateway only uses the Python standard library.
+#
+# This file exists so the local packaging environment can be recreated
+# reproducibly. Add build/release tooling here when it is actually needed.
