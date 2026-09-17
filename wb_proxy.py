@@ -1509,8 +1509,9 @@ def read_product_config_models(realm=None):
 UPSTREAM_MODEL_META_KEYS = (
     "credits", "name", "descriptionEn", "descriptionZh",
     "maxInputTokens", "maxOutputTokens", "maxAllowedSize",
-    "supportsImages", "supportsToolCall", "supportsReasoning",
-    "onlyReasoning", "reasoning", "tags", "vendor", "isDefault",
+    "contextWindow", "supportsImages", "supportsToolCall",
+    "supportsReasoning", "onlyReasoning", "reasoning", "tags",
+    "vendor", "isDefault", "disabledMultimodal",
 )
 
 
@@ -1534,19 +1535,33 @@ def fetch_endpoint_models():
         log(f"model discovery failed: {exc}")
         cached = _models_cache.get("intl", {}).get("data")
         return list(cached or [])
+    data = payload.get("data") or {}
     out, seen = [], set()
-    for agent in (payload.get("data") or {}).get("agents") or []:
+
+    def _add(entry):
+        if isinstance(entry, dict):
+            mid = entry.get("id")
+            meta = {k: entry[k] for k in UPSTREAM_MODEL_META_KEYS if k in entry}
+        else:
+            mid, meta = entry, {}
+        if not mid or mid in seen:
+            return
+        seen.add(mid)
+        out.append((mid, meta))
+
+    # Preferred: data.models is a rich list of dicts carrying `credits`
+    # (the live multiplier) plus full capability metadata.
+    rich = data.get("models")
+    if isinstance(rich, list):
+        for entry in rich:
+            _add(entry)
+        if out:
+            return out
+
+    # Fallback: data.agents[].models (usually just model-id strings).
+    for agent in data.get("agents") or []:
         for entry in agent.get("models") or []:
-            # Upstream entries are usually dicts, but tolerate bare ids too.
-            if isinstance(entry, dict):
-                mid = entry.get("id")
-                meta = {k: entry[k] for k in UPSTREAM_MODEL_META_KEYS if k in entry}
-            else:
-                mid, meta = entry, {}
-            if not mid or mid in seen:
-                continue
-            seen.add(mid)
-            out.append((mid, meta))
+            _add(entry)
     return out
 def strip_data_prefix(line):
     line = line.strip()
