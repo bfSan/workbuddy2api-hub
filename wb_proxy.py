@@ -248,6 +248,8 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
         row.update(fp)
     if account:
         row["account"] = account
+    # PATCH(wb-hub-usage-key) 记下是哪个 Key 发起的
+    row.update(wb_patch_key_fields())
     acc = POOL.get(account) if (account and POOL) else None
     row["realm"] = acc.realm if acc else CURRENT_REALM
     # Derived per-request rates (None-safe).
@@ -326,6 +328,7 @@ def record_error(model, status, message, elapsed_ms=None):
         "message": str(message)[:200],
         "elapsed_ms": elapsed_ms,
     }
+    row.update(wb_patch_key_fields())
     with _lock:
         _usage["errors"] += 1
         if elapsed_ms is not None:
@@ -662,7 +665,12 @@ def account_views(realm=None):
     """List view of every account, including a live readiness flag."""
     if not POOL:
         return []
-    return POOL.list_public(realm=realm)
+    views = POOL.list_public(realm=realm)
+    # PATCH(wb-hub-account-alias) 带上自定义别名；面板各处优先显示 alias，没有才回落到上游昵称
+    aliases = wb_patch_account_aliases()
+    for view in views:
+        view["alias"] = aliases.get(view.get("uid") or "") or ""
+    return views
 _byacct_cache = {"at": 0.0, "data": None}
 _byacct_lock = threading.Lock()
 
@@ -839,6 +847,10 @@ def compute_usage_analytics():
     for m in model_map.values():
         finalize(m["today"])
         finalize(m["all_time"])
+    # PATCH(wb-hub-account-alias) 看板按账号聚合同样带别名
+    _alias_map = wb_patch_account_aliases()
+    for _acct in acct_map.values():
+        _acct["alias"] = _alias_map.get(_acct.get("uid") or "") or ""
     accts_list = sorted(acct_map.values(), key=lambda a: (-a["today"]["total_tokens"], -a["all_time"]["total_tokens"]))
     models_list = sorted(model_map.values(), key=lambda m: (-m["today"]["total_tokens"], -m["all_time"]["total_tokens"]))
     return {
@@ -862,10 +874,26 @@ def runtime_settings_view():
             "name": entry.get("name") or "",
             "realm": entry.get("realm") or "",
             "enabled": entry.get("enabled", True) is not False,
+            # PATCH(wb-hub-key-accounts) 面板要拿已勾选的账号来回显
+            "accounts": entry.get("accounts") or [],
             "masked": (raw[:4] + "*" * 6 + raw[-4:]) if len(raw) > 8 else "*" * len(raw),
             "source": entry.get("source") or "panel",
         })
+    # PATCH(wb-hub-key-accounts) 给面板的「限定账号」勾选框提供候选（不过滤 realm，跨出口也要能选）
+    _acct_opts = []
+    try:
+        for _a in (account_views() if POOL else []):
+            _acct_opts.append({
+                "uid": _a.get("uid") or "",
+                "nickname": _a.get("nickname") or (_a.get("uid") or "")[:8],
+                "realm": _a.get("realm") or "",
+            })
+    except Exception:
+        _acct_opts = []
     return {
+        "account_options": _acct_opts,
+        # PATCH(wb-hub-account-alias) 整张别名表给前端，任务页/看板都能按 uid 反查显示名
+        "account_aliases": wb_patch_account_aliases(),
         "panel_password_is_default": wb_settings.panel_password_is_default(ACCOUNTS_DIR),
         "api_key_set": bool(key),
         "api_key_set_by_panel": API_KEY_FILE_SET,
@@ -1040,6 +1068,7 @@ def is_chat_model(mid):
     return True
 CN_UI_ORDER = [
     "hy4-preview-f",
+    "hy4-preview",
     "hy3",
     "deepseek-v4.1-flash",
     "glm-5.3",
@@ -1091,10 +1120,185 @@ def merge_catalog(primary, realm=None):
             merged[mid] = {}
     order = CN_UI_ORDER if r == "cn" else INTL_UI_ORDER
     out = []
+    seen = set()
     for mid in order:
         if mid in merged:
             out.append((mid, merged[mid]))
+            seen.add(mid)
+    # PATCH(wb-hub-complete-models) order 只是"优先排序"，不是白名单：
+    # 未在 order 中出现的模型（比如后加入的 hy4-preview）按原顺序追加，避免被静默丢弃。
+    for mid, meta in merged.items():
+        if mid not in seen:
+            out.append((mid, meta))
     return out
+def wb_patch_pick(entries, r):
+    """# PATCH(wb-hub-curated-models) 精选模型列表：只暴露 WB_MODEL_PREFIXES 里的前缀。
+
+    - WB_MODEL_PREFIXES  逗号分隔的前缀，如 "hy4,gpt"；留空 = 不过滤（返回全量）
+    - WB_MODEL_EXCLUDE   逗号分隔的排除前缀，如 "hy4-preview-dev,hy4-preview-x"
+    - CN 出口下会自动并入国际版静态目录，这样 gpt-* 这类只在国际版登记的
+      模型也能出现在列表里。
+    """
+    pool = list(entries)
+    if r == "cn":
+        try:
+            pool = pool + merge_catalog([], realm="intl")
+        except Exception:
+            pass
+
+    # WB_MODEL_SET=official -> 只输出官方面板那两份清单（国际版 16 + 国内版 14 去重）
+    if os.environ.get("WB_MODEL_SET", "").strip().lower() == "official":
+        index = {}
+        for mid, meta in pool:
+            if mid and mid not in index:
+                index[mid] = meta
+        wanted = list(INTL_UI_ORDER) + [m for m in CN_UI_ORDER if m not in INTL_UI_ORDER]
+        return [(m, index[m]) for m in wanted if m in index]
+
+    prefixes = [p.strip().lower() for p in os.environ.get("WB_MODEL_PREFIXES", "").split(",") if p.strip()]
+    if not prefixes:
+        return entries
+    excludes = [p.strip().lower() for p in os.environ.get("WB_MODEL_EXCLUDE", "").split(",") if p.strip()]
+    out, seen = [], set()
+    for mid, meta in pool:
+        if not mid or mid in seen:
+            continue
+        low = mid.lower()
+        if not any(low.startswith(p) for p in prefixes):
+            continue
+        if any(low.startswith(p) for p in excludes):
+            continue
+        seen.add(mid)
+        out.append((mid, meta))
+    order = CN_UI_ORDER if r == "cn" else INTL_UI_ORDER
+    out.sort(key=lambda kv: order.index(kv[0]) if kv[0] in order else len(order))
+    return out
+
+
+def wb_patch_task_targets(pool, uid=None, realm="cn"):
+    """# PATCH(wb-hub-tasks-all) 成长任务 / 猫猫旅行的目标账号列表。
+
+    - 传 uid   -> 只跑这一个号（保留原来的单号语义）
+    - 不传 uid -> 依次跑该出口下所有带 token 的号
+    """
+    if pool is None:
+        return []
+    if uid:
+        acc = pool.get(uid)
+        return [acc] if acc else []
+    return [a for a in getattr(pool, "accounts", [])
+            if getattr(a, "realm", None) == realm and getattr(a, "access_token", None)]
+
+
+def wb_patch_key_uids(key_entry):
+    """# PATCH(wb-hub-key-accounts) 取出某个 Key 允许使用的账号 uid 集合。
+
+    返回 None 表示「不限制」（没配 / 配的账号都不存在了），返回 set 表示只许用这些号。
+    """
+    entry = key_entry or {}
+    raw = entry.get("accounts")
+    if not isinstance(raw, (list, tuple)):
+        return None
+    wanted = set(str(x).strip() for x in raw if str(x).strip())
+    if not wanted or POOL is None:
+        return None
+    known = set(a.uid for a in POOL.accounts)
+    uids = wanted & known
+    return uids or None
+
+
+def wb_patch_tenant_session_key(session_key, key_entry):
+    """# PATCH(wb-hub-key-accounts) 给会话粘性的 key 加上租户前缀。
+
+    上游的 extract_session_key() 只看 X-Conversation-Id / payload 的 conversation_id，
+    不含调用方身份；两个租户若撞了同一个 id 会共享同一个账号绑定，白名单就形同虚设。
+    """
+    if not session_key:
+        return None
+    entry = key_entry or {}
+    owner = str(entry.get("id") or "").strip() or str(entry.get("key") or "")[:8] or "anon"
+    return "%s::%s" % (owner, session_key)
+
+
+_WB_PATCH_ALIAS_CACHE = {"stamp": 0, "data": {}}
+
+
+def wb_patch_account_aliases():
+    """# PATCH(wb-hub-account-alias) 账号别名表（uid -> 别名），按 settings.json 的 mtime 缓存。"""
+    try:
+        stamp = os.path.getmtime(wb_settings.settings_path(ACCOUNTS_DIR))
+    except Exception:
+        stamp = 0
+    if _WB_PATCH_ALIAS_CACHE.get("stamp") != stamp:
+        try:
+            data = wb_settings.account_aliases(ACCOUNTS_DIR)
+        except Exception:
+            data = {}
+        _WB_PATCH_ALIAS_CACHE["stamp"] = stamp
+        _WB_PATCH_ALIAS_CACHE["data"] = data
+    return _WB_PATCH_ALIAS_CACHE.get("data") or {}
+
+
+_WB_PATCH_KEY_TLS = threading.local()
+
+
+def wb_patch_set_key(entry):
+    """# PATCH(wb-hub-usage-key) 记住当前请求用的是哪个 API Key（供 record_usage 读取）。"""
+    entry = entry or {}
+    _WB_PATCH_KEY_TLS.key_id = str(entry.get("id") or "")
+    _WB_PATCH_KEY_TLS.key_name = str(entry.get("name") or "")
+
+
+def wb_patch_key_fields():
+    """当前请求的 Key 维度字段；取不到就是空串（见 usage_by_key 的「(埋点前)」）。"""
+    return {
+        "key_id": getattr(_WB_PATCH_KEY_TLS, "key_id", "") or "",
+        "key_name": getattr(_WB_PATCH_KEY_TLS, "key_name", "") or "",
+    }
+
+
+def usage_by_key():
+    """# PATCH(wb-hub-usage-key) 按 API Key 聚合用量流水 —— 多租户场景下看「谁用了多少」。"""
+    buckets = {}
+    try:
+        with open(USAGE_LOG, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                kid = str(row.get("key_id") or "")
+                kname = str(row.get("key_name") or "")
+                token = kid or kname or "(埋点前)"
+                bucket = buckets.setdefault(token, {
+                    "key_id": kid, "key_name": kname,
+                    "label": kname or kid or "(埋点前)",
+                    "requests": 0, "errors": 0, "prompt_tokens": 0,
+                    "completion_tokens": 0, "total_tokens": 0, "credit": 0.0,
+                    "models": {}, "accounts": {},
+                })
+                if row.get("error"):
+                    bucket["errors"] += 1
+                    continue
+                bucket["requests"] += 1
+                for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                    bucket[field] += row.get(field) or 0
+                try:
+                    bucket["credit"] += float(row.get("credit") or 0)
+                except (TypeError, ValueError):
+                    pass
+                model = row.get("model") or "?"
+                bucket["models"][model] = bucket["models"].get(model, 0) + 1
+                acct = row.get("account") or "(unattributed)"
+                bucket["accounts"][acct] = bucket["accounts"].get(acct, 0) + 1
+    except Exception as exc:
+        log("usage_by_key failed: %s" % exc)
+    return sorted(buckets.values(), key=lambda b: (-b["total_tokens"], -b["requests"]))
+
+
 def fetch_models(realm=None):
     r = realm or CURRENT_REALM
     with _lock:
@@ -1105,6 +1309,7 @@ def fetch_models(realm=None):
     if not live and r == "intl":
         live = [(m, {}) for m in fetch_endpoint_models()]
     entries = merge_catalog(live, realm=r)
+    entries = wb_patch_pick(entries, r)
     with _lock:
         _models_cache[r] = {"at": time.time(), "data": entries}
     return entries
@@ -1601,7 +1806,7 @@ def build_upstream_body(payload):
     if "stream_options" not in body:
         body["stream_options"] = {"include_usage": True}
     return body
-def open_upstream(payload, session_key=None, target_realm=None):
+def open_upstream(payload, session_key=None, target_realm=None, allow=None):
     realm = target_realm or detect_model_realm(payload.get("model")) or CURRENT_REALM
     upstream_body = build_upstream_body(payload)
     body = json.dumps(upstream_body, ensure_ascii=False).encode("utf-8")
@@ -1614,6 +1819,14 @@ def open_upstream(payload, session_key=None, target_realm=None):
             log("affinity: derived %s for %d msgs"
                 % (session_key, len(upstream_body.get("messages") or [])))
     total = max(1, POOL.count_ready(realm)) if POOL else 1
+    # PATCH(wb-hub-cooloff-scope) 冷却时长要按「这个 Key 真正用得上的号」算，不能拿全局 ready 数。
+    # 只有 1 个可用号时让 note_error 走 3 秒短冷却，避免一次 429 就把该 Key 冻死 5 分钟。
+    if POOL and allow:
+        _allowed = sum(1 for _a in POOL.accounts
+                       if _a.uid in allow and _a.realm == realm
+                       and _a.enabled and _a.access_token)
+        if _allowed:
+            total = _allowed
     tried = set()
     last_error = None
     for _ in range(total):
@@ -1622,6 +1835,11 @@ def open_upstream(payload, session_key=None, target_realm=None):
             break
         if account.realm != realm:
             if session_key and POOL: POOL.affinity.unbind(session_key)
+            continue
+        # PATCH(wb-hub-key-accounts) 越界的号直接跳过并拉黑，交还给轮询找下一个
+        if allow is not None and account.uid not in allow:
+            if session_key and POOL: POOL.affinity.unbind(session_key)
+            tried.add(account.uid)
             continue
         tried.add(account.uid)
         cfg = wb_accounts.get_realm_config(account.realm)
@@ -2595,6 +2813,8 @@ class Handler(BaseHTTPRequestHandler):
         if self._panel_ok():
             return True
         self.key_entry = identify_key(self._supplied_key())
+        # PATCH(wb-hub-usage-key) 记下调用方身份，供 record_usage / record_error 写入流水
+        wb_patch_set_key(self.key_entry)
         if self.key_entry:
             return True
         if not auth_required():
@@ -2724,7 +2944,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/realm":
             return self._json(200, {"current": CURRENT_REALM, "options": ["intl", "cn"]})
         if path in ("/v1/models", "/models"):
-            if not self._authorized():
+            # # PATCH(wb-hub-public-models) 模型列表默认免鉴权（设 WB_PUBLIC_MODELS=0 恢复需要 key），
+            # 这样 Codex++ 之类只认 base_url 的客户端也能自动补全下拉列表。
+            if os.environ.get("WB_PUBLIC_MODELS", "1") != "1" and not self._authorized():
                 return
             req_realm = self._request_realm() or CURRENT_REALM
             try:
@@ -2738,6 +2960,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             req_realm = query.get('realm', [None])[0] or self.headers.get('X-Realm') or CURRENT_REALM
             return self._json(200, usage_snapshot(realm=req_realm))
+        if path == "/usage/by-key":
+            if not self._authorized():
+                return
+            return self._json(200, {"keys": usage_by_key()})
         if path == "/usage/recent":
             if not self._authorized():
                 return
@@ -2977,12 +3203,19 @@ class Handler(BaseHTTPRequestHandler):
                 if realm not in ("", "intl", "cn"):
                     return self._error(400, "realm must be intl, cn or empty",
                                        "invalid_request_error")
+                # PATCH(wb-hub-key-accounts) 面板勾选的账号白名单，空 = 不限
+                accounts = item.get("accounts")
+                if isinstance(accounts, (list, tuple)):
+                    accounts = [str(x).strip() for x in accounts if str(x).strip()]
+                else:
+                    accounts = []
                 cleaned.append({
                     "id": entry_id,
                     "name": str(item.get("name") or "").strip(),
                     "key": value,
                     "realm": realm,
                     "enabled": item.get("enabled", True) is not False,
+                    "accounts": accounts,
                 })
             wb_settings.set_api_keys(ACCOUNTS_DIR, cleaned)
             reply["api_keys_saved"] = len(cleaned)
@@ -3297,6 +3530,8 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_responses(self, payload):
         """Serve /v1/responses by translating to chat completions upstream."""
         session_key = extract_session_key(self.headers, payload)
+        # PATCH(wb-hub-key-accounts) 会话粘性隔离到租户维度
+        session_key = wb_patch_tenant_session_key(session_key, self.key_entry)
         custom_names = custom_tool_names(payload.get("tools"))
         chat_req = responses_to_chat(payload)
         model = payload.get("model") or "deepseek-v4.1-flash"
@@ -3310,11 +3545,15 @@ class Handler(BaseHTTPRequestHandler):
                sorted(custom_names) or "-")
         )
         try:
-            req_realm = self._request_realm() or CURRENT_REALM
-            blocked = self._cross_realm_error(chat_req.get("model"), req_realm)
-            if blocked:
-                return self._error(400, blocked, "invalid_request_error")
-            upstream, account = open_upstream(chat_req, session_key=session_key, target_realm=req_realm)
+            # # PATCH(wb-hub-auto-realm) 未绑定出口的 key：把出口交给模型名自动判定
+            req_realm = self._request_realm()
+            if req_realm:
+                blocked = self._cross_realm_error(chat_req.get("model"), req_realm)
+                if blocked:
+                    return self._error(400, blocked, "invalid_request_error")
+            upstream, account = open_upstream(chat_req, session_key=session_key,
+                                        target_realm=req_realm,
+                                        allow=wb_patch_key_uids(self.key_entry))
         except urllib.error.HTTPError as exc:
             detail = exc.read(600).decode("utf-8", "replace")
             record_error(model, exc.code, detail,
@@ -3418,16 +3657,22 @@ class Handler(BaseHTTPRequestHandler):
             )
         )
         session_key = extract_session_key(self.headers, payload)
+        # PATCH(wb-hub-key-accounts) 会话粘性隔离到租户维度
+        session_key = wb_patch_tenant_session_key(session_key, self.key_entry)
         fp = prompt_fingerprint(forwarded.get("messages"))
         want_stream = bool(payload.get("stream"))
         model = payload.get("model") or "hy4-preview"
         t_start = time.time()
         try:
-            req_realm = self._request_realm() or CURRENT_REALM
-            blocked = self._cross_realm_error(payload.get("model"), req_realm)
-            if blocked:
-                return self._error(400, blocked, "invalid_request_error")
-            upstream, account = open_upstream(payload, session_key=session_key, target_realm=req_realm)
+            # # PATCH(wb-hub-auto-realm) 未绑定出口的 key：把出口交给模型名自动判定
+            req_realm = self._request_realm()
+            if req_realm:
+                blocked = self._cross_realm_error(payload.get("model"), req_realm)
+                if blocked:
+                    return self._error(400, blocked, "invalid_request_error")
+            upstream, account = open_upstream(payload, session_key=session_key,
+                                       target_realm=req_realm,
+                                       allow=wb_patch_key_uids(self.key_entry))
         except urllib.error.HTTPError as exc:
             detail = exc.read(600).decode("utf-8", "replace")
             record_error(model, exc.code, detail,

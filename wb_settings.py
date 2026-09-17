@@ -156,12 +156,20 @@ def _clean_key_entry(entry):
     realm = str(entry.get("realm") or "").strip().lower()
     if realm not in REALMS:
         realm = ""
+    # PATCH(wb-hub-key-accounts) 这个函数的返回字典是硬编码的白名单，
+    # 不在这里放行的话 accounts 会被静默丢掉（面板看着存进去了，重启就没了）。
+    accounts = entry.get("accounts")
+    if isinstance(accounts, (list, tuple)):
+        accounts = [str(x).strip() for x in accounts if str(x).strip()]
+    else:
+        accounts = []
     return {
         "id": str(entry.get("id") or secrets.token_hex(6)),
         "name": str(entry.get("name") or "").strip() or "未命名",
         "key": key,
         "realm": realm,
         "enabled": entry.get("enabled", True) is not False,
+        "accounts": accounts,
     }
 
 
@@ -296,3 +304,33 @@ class PanelSessions(object):
     def revoke_all(self):
         with self._lock:
             self._tokens.clear()
+
+
+def account_aliases(accounts_dir):
+    """# PATCH(wb-hub-account-alias) 账号别名表：uid -> 别名。空值会被丢掉，等于该号用回上游昵称。"""
+    data = load(accounts_dir)
+    raw = data.get("account_aliases")
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for key, value in raw.items():
+        uid = str(key or "").strip()
+        name = str(value or "").strip()
+        if uid and name:
+            out[uid] = name
+    return out
+
+
+def set_account_aliases(accounts_dir, mapping):
+    """整体覆盖别名表（面板每次提交全量）。"""
+    data = load(accounts_dir)
+    raw = mapping if isinstance(mapping, dict) else {}
+    out = {}
+    for key, value in raw.items():
+        uid = str(key or "").strip()
+        name = str(value or "").strip()
+        if uid and name:
+            out[uid] = name
+    data["account_aliases"] = out
+    save(accounts_dir, data)
+    return out
