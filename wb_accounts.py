@@ -153,6 +153,19 @@ class Account(object):
         self.enabled = data.get("enabled", True)
         self.last_error = str(data.get("lastError") or "")
         self.cooldown_until = float(data.get("cooldownUntil") or 0)
+        # Per-model cooldown: model_id -> epoch seconds until which that
+        # specific model is blocked on this account. Lets one model's 429
+        # freeze only that model instead of the whole account.
+        raw_map = data.get("modelCooldowns") or {}
+        self.model_cooldowns = {}
+        if isinstance(raw_map, dict):
+            for _mid, _ts in raw_map.items():
+                try:
+                    _ts = float(_ts)
+                    if _ts > time.time():
+                        self.model_cooldowns[str(_mid)] = _ts
+                except (TypeError, ValueError):
+                    continue
         self.credits = data.get("credits") or None
         self.last_checkin = data.get("lastCheckin") or None
 
@@ -172,6 +185,7 @@ class Account(object):
             "enabled": self.enabled,
             "lastError": self.last_error,
             "cooldownUntil": self.cooldown_until,
+            "modelCooldowns": self.model_cooldowns,
             "credits": self.credits,
             "lastCheckin": self.last_checkin,
         }
@@ -193,6 +207,11 @@ class Account(object):
             "lastError": self.last_error,
             "inCooldown": self.cooldown_until > time.time(),
             "cooldownFor": round(max(0.0, self.cooldown_until - time.time())) or None,
+            "cooldowns": [
+                {"model": m, "until": int(ts),
+                 "seconds": int(round(max(0.0, ts - time.time())))}
+                for m, ts in sorted(self.model_cooldowns.items())
+            ],
             "addedAt": self.added_at,
             "file": os.path.basename(self.path) if self.path else None,
             "credits": self.credits,
@@ -220,10 +239,15 @@ class Account(object):
         if self.path and os.path.exists(self.path):
             os.remove(self.path)
 
-    def ready(self):
+    def ready(self, model=None):
         if not self.enabled or not self.access_token:
             return False
         if self.cooldown_until > time.time():
+            return False
+        # Per-model cooldown: when picking for a specific model, a model that
+        # is blocked on this account must not satisfy the request, but the
+        # account can still serve other models.
+        if model and self.cooldown_until_model(model) > time.time():
             return False
         exp = self.expires_at or jwt_exp(self.access_token)
         if not exp:
@@ -395,15 +419,37 @@ class Account(object):
             self.save(os.path.dirname(self.path))
         return {"ok": True, "credits": self.credits}
 
-    def note_error(self, message, cooldown=60, single_account=False):
+    def cooldown_until_model(self, model):
+        """Epoch seconds until which `model` is blocked on this account (0 if not)."""
+        if not model:
+            return 0
+        return float(self.model_cooldowns.get(str(model)) or 0)
+
+    def note_error(self, message, cooldown=60, single_account=False, model=None,
+                   account_wide=True):
+        """Record an upstream error.
+
+        account_wide=False + model => freeze ONLY that model on this account
+        (e.g. a 429 rate-limit on one model), so the rest of the account keeps
+        serving other models. Otherwise the whole account cools down.
+        """
         self.last_error = str(message)[:200]
         actual_cooldown = 3 if single_account else cooldown
-        self.cooldown_until = time.time() + actual_cooldown
+        until = time.time() + actual_cooldown
+        if account_wide:
+            self.cooldown_until = until
+        if model:
+            self.model_cooldowns[str(model)] = until
 
-    def clear_error(self):
-        if self.last_error or self.cooldown_until:
-            self.last_error = ""
-            self.cooldown_until = 0
+    def clear_error(self, model=None):
+        """Clear the account-wide cooldown, and either one model's cooldown
+        (model given) or the whole per-model map (model omitted)."""
+        self.last_error = ""
+        self.cooldown_until = 0
+        if model:
+            self.model_cooldowns.pop(str(model), None)
+        else:
+            self.model_cooldowns = {}
 
 def _human_delta(seconds):
     if seconds is None: return None
@@ -600,21 +646,22 @@ class AccountPool(object):
             snapshot = [a for a in self.accounts if not realm or a.realm == realm]
         return sum(1 for a in snapshot if a.enabled and a.access_token)
 
-    def pick_for_session(self, realm=None, session_key=None, exclude=None):
+    def pick_for_session(self, realm=None, session_key=None, exclude=None, model=None):
         exclude = exclude or set()
         if session_key:
             bound_uid = self.affinity.get(session_key)
             if bound_uid and bound_uid not in exclude:
                 account = self.get(bound_uid)
-                if account and account.realm == realm and account.ready():
+                # skip the bound account if it is cooling down for this model
+                if account and account.realm == realm and account.ready(model=model):
                     return account
                 self.affinity.unbind(session_key)
-        account = self.pick(realm=realm, exclude=exclude)
+        account = self.pick(realm=realm, exclude=exclude, model=model)
         if account and session_key:
             self.affinity.bind(session_key, account.uid)
         return account
 
-    def pick(self, realm=None, exclude=None):
+    def pick(self, realm=None, exclude=None, model=None):
         exclude = exclude or set()
         with self._lock:
             snapshot = [a for a in self.accounts if not realm or a.realm == realm]
@@ -625,7 +672,7 @@ class AccountPool(object):
             index = (start + offset) % total
             account = snapshot[index]
             if account.uid in exclude: continue
-            if account.ready():
+            if account.ready(model=model):
                 with self._lock: self._cursor = (index + 1) % total
                 return account
         return None

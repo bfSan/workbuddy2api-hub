@@ -295,8 +295,13 @@ a:hover{text-decoration:underline}
   <section>
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
       <h2 style="margin:0">当前版本模型库与能力清单 <em id="availModelCount"></em></h2>
-      <div style="font-size:12px;color:var(--dim)">展示当前视图下官方对话大模型、上下文容量、推理/视觉能力及在售倍率</div>
+      <div style="display:flex;align-items:center;gap:10px">
+        <button class="sec mini" id="btnModelEdit" onclick="toggleModelEdit()">编辑列表</button>
+        <button class="primary mini" id="btnModelSave" style="display:none" onclick="saveModelConfig(this)">保存</button>
+      </div>
     </div>
+    <div style="font-size:12px;color:var(--dim);margin-bottom:10px">展示当前视图下官方对话大模型、上下文容量、推理/视觉能力及在售倍率</div>
+    <div id="hiddenModelsBar" style="display:none;margin-bottom:10px;padding:8px 12px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;font-size:12px"></div>
     <div style="overflow-x:auto">
       <table id="modelsTable">
         <thead>
@@ -307,6 +312,7 @@ a:hover{text-decoration:underline}
             <th>上下文窗口</th>
             <th>最大输出</th>
             <th>思考能力 / 推理档位</th>
+            <th id="modelsActionTh" style="display:none;text-align:right;width:140px">操作</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -781,6 +787,13 @@ async function loadModels(){
   try{
     const r = await getJSON('/v1/models?realm=' + encodeURIComponent(window.VIEW_REALM));
     MODELS_DATA = r.data || [];
+    // 拉取面板配置，用于「已隐藏 / 恢复」条与编辑态
+    try{
+      const cfg = await getJSON('/settings/models');
+      const rc = (cfg.realms || {})[window.VIEW_REALM] || {};
+      MODEL_POOL = rc.pool || [];
+      MODEL_CONFIG = { hidden: rc.hidden || [], order: rc.order || [] };
+    }catch(e){ MODEL_POOL = MODELS_DATA.map(m => m.id); }
     renderAvailableModels();
   }catch(e){
     console.error('loadModels error:', e);
@@ -856,6 +869,13 @@ function renderAvailableModels(){
       effort = '<span class="badge" style="background:rgba(217,119,6,.15);color:var(--think);font-size:11px">支持思考</span>';
     }
 
+    const actionCell = MODEL_EDIT_MODE
+      ? '<td style="text-align:right;white-space:nowrap">'
+          + '<button class="sec mini" onclick="moveModel(&quot;' + esc(m.id) + '&quot;,-1)" title="上移">↑</button> '
+          + '<button class="sec mini" onclick="moveModel(&quot;' + esc(m.id) + '&quot;,1)" title="下移">↓</button> '
+          + '<button class="danger mini" onclick="hideModel(&quot;' + esc(m.id) + '&quot;)" title="从列表隐藏">隐藏</button>'
+        + '</td>'
+      : '';
     return '<tr>'
       + '<td class="mono"><b>' + esc(m.id) + '</b></td>'
       + '<td>' + credBadge + '</td>'
@@ -863,8 +883,78 @@ function renderAvailableModels(){
       + '<td>' + ctx + '</td>'
       + '<td>' + maxOut + '</td>'
       + '<td>' + effort + '</td>'
+      + actionCell
       + '</tr>';
   }).join('');
+  renderHiddenModelsBar();
+}
+
+/* --------------------- 模型列表显隐 / 排序（可配置） --------------------- */
+window.MODEL_EDIT_MODE = false;
+window.MODEL_CONFIG = { hidden: [], order: [] };
+window.MODEL_POOL = [];   // 该 realm 的合并后全量池（含已隐藏项）
+
+function toggleModelEdit(){
+  MODEL_EDIT_MODE = !MODEL_EDIT_MODE;
+  const th = document.getElementById('modelsActionTh');
+  if(th) th.style.display = MODEL_EDIT_MODE ? '' : 'none';
+  const btn = document.getElementById('btnModelEdit');
+  if(btn) btn.textContent = MODEL_EDIT_MODE ? '退出编辑' : '编辑列表';
+  const save = document.getElementById('btnModelSave');
+  if(save) save.style.display = MODEL_EDIT_MODE ? '' : 'none';
+  renderAvailableModels();
+}
+
+function renderHiddenModelsBar(){
+  const bar = document.getElementById('hiddenModelsBar');
+  if(!bar) return;
+  if(!MODEL_EDIT_MODE){ bar.style.display = 'none'; return; }
+  const hidden = MODEL_CONFIG.hidden || [];
+  if(!hidden.length){ bar.style.display = 'none'; bar.innerHTML = ''; return; }
+  bar.style.display = '';
+  bar.innerHTML = '<b style="color:var(--fg)">已隐藏：</b> '
+    + hidden.map(id => '<button class="sec mini" style="margin:2px" onclick="unhideModel(&quot;' + esc(id) + '&quot;)" title="点击恢复显示">' + esc(id) + ' ✕</button>').join(' ')
+    + '<span style="color:var(--dim)">点击模型名可恢复显示</span>';
+}
+
+function hideModel(id){
+  if(!(MODEL_CONFIG.hidden || []).includes(id)) MODEL_CONFIG.hidden.push(id);
+  window.MODELS_DATA = MODELS_DATA.filter(m => m.id !== id);
+  renderAvailableModels();
+}
+
+function unhideModel(id){
+  MODEL_CONFIG.hidden = (MODEL_CONFIG.hidden || []).filter(x => x !== id);
+  loadModels();
+}
+
+function moveModel(id, dir){
+  const ids = MODELS_DATA.map(m => m.id);
+  const i = ids.indexOf(id);
+  if(i < 0) return;
+  const j = i + dir;
+  if(j < 0 || j >= ids.length) return;
+  const arr = MODELS_DATA.slice();
+  const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+  window.MODELS_DATA = arr;
+  MODEL_CONFIG.order = arr.map(m => m.id);
+  renderAvailableModels();
+}
+
+async function saveModelConfig(btn){
+  if(btn){ btn.disabled = true; btn.textContent = '保存中...'; }
+  try{
+    const order = (MODELS_DATA || []).map(m => m.id);
+    const payload = {model_config: {}};
+    payload.model_config[window.VIEW_REALM] = {hidden: MODEL_CONFIG.hidden || [], order: order};
+    await postJSON('/settings/save', payload);
+    toast('模型列表配置已保存', 'ok');
+    await loadModels();
+  }catch(e){
+    toast('保存失败: ' + e.message, 'bad');
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '保存'; }
+  }
 }
 
 let CURRENT_GROWTH_UID = 'all';
@@ -1306,6 +1396,13 @@ function accountRow(a){
               : a.expiresIn === 'expired' ? '<span class="badge bad">已过期</span>'
               : '<span class="badge ok">可用</span>';
   const err = a.lastError ? '<div class="hint" style="color:var(--warn);margin:2px 0 0">' + esc(a.lastError) + '</div>' : '';
+  // 按模型冷却明细：某个模型 429 只冻结该模型，这里逐条显示剩余时间
+  const cooldowns = Array.isArray(a.cooldowns) ? a.cooldowns.filter(c => c && c.seconds > 0) : [];
+  const coolDetail = cooldowns.length
+    ? '<div class="mono" style="color:var(--warn);font-size:11px;margin-top:2px" title="各模型单独冷却（429 只冻结该模型）">'
+        + cooldowns.map(c => esc(c.model) + ': ' + fmt(c.seconds) + 's').join(' · ')
+        + '</div>'
+    : '';
   const cred = a.credits;
   const credText = cred ? ('<b style="color:var(--accent2)">' + fmt(cred.remain) + '</b> / ' + fmt(cred.size)) : '<span style="color:var(--dim)">未查询</span>';
   return '<tr>'
@@ -1314,7 +1411,7 @@ function accountRow(a){
     +   '<div style="font-weight:600;font-size:13px;color:var(--fg)">' + esc(accName(a)) + '</div>'
     + '<div class="mono" style="color:var(--dim);font-size:11px">' + esc(a.uid.slice(0,8)) + ' · ' + esc(a.source) + ' · 到期 ' + esc(a.expiresIn || '?') + '</div>'
     + (a.machineId ? ('<div class="mono" style="color:var(--dim);font-size:10px;margin-top:2px" title="由账号UID稳定派生的专属设备码，防多号关联风控">设备码: ' + esc(a.machineId.slice(0,14)) + '...</div>') : '')
-    + err + '</td>'
+    + err + coolDetail + '</td>'
     + '<td style="text-align:center">' + state + '</td>'
     + '<td style="text-align:left;white-space:nowrap">' + credText + '</td>'
     + '<td style="text-align:right">' + fmt(usage.requests) + '</td>'
