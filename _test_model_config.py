@@ -67,5 +67,119 @@ wrapped = P.wb_patch_pick(list(P.merge_catalog([], realm="cn")), "cn")
 check("empty config is a no-op", plain == wrapped)
 
 print()
+print("[5] preset aliases are chat-visible and keep their upstream credits")
+aliases = dict(P.merge_catalog([
+    ("fast-model", {"credits": "x0.21", "name": "快速"}),
+    ("balanced-model", {"credits": "x0.65", "name": "均衡"}),
+    ("deep-model", {"credits": "x1.20", "name": "极致"}),
+], realm="cn"))
+for alias in ("fast-model", "balanced-model", "deep-model"):
+    check(alias + " present", alias in aliases, sorted(aliases.keys())[:12])
+check("preset credits retained", aliases.get("balanced-model", {}).get("credits") == "x0.65")
+check("primary-model still excluded", "primary-model" not in aliases)
+
+print()
+print("[6] sync hides models that the env filter currently excludes")
+sync = P.reconcile_model_sync(
+    ["hy3", "deepseek-v4.1-flash", "glm-5.3", "kimi-k3"],
+    ["hy3", "deepseek-v4.1-flash", "glm-5.3", "kimi-k3", "fast-model", "internal-hidden"],
+    "cn",
+)
+check("newly discovered alias is visible", "fast-model" in sync["visible"], sync)
+check("previously filtered model is hidden", "internal-hidden" in sync["hidden"], sync)
+check("currently visible model remains visible", "hy3" in sync["visible"], sync)
+
+print()
+print("[7] multiple model sources merge without losing aliases")
+merged = dict(P.merge_catalog([
+    ("hy3", {"credits": "x9.99"}),
+    ("fast-model", {"credits": "x0.21"}),
+], realm="cn"))
+check("real model and alias coexist", "hy3" in merged and "fast-model" in merged,
+      {"hy3": "hy3" in merged, "fast": "fast-model" in merged})
+
+print()
+print("[8] endpoint discovery merges rich models and agent presets")
+payload = {
+    "data": {
+        "models": [
+            {"id": "hy3", "credits": "x0.10", "name": "HY3"},
+            {"id": "glm-5.3", "credits": "x0.20"},
+        ],
+        "agents": [{
+            "models": [
+                {"id": "fast-model", "credits": "x0.21", "name": "快速"},
+                {"id": "balanced-model", "credits": "x0.65", "name": "均衡"},
+                {"id": "deep-model", "credits": "x1.20", "name": "极致"},
+            ],
+        }],
+    },
+}
+endpoint = dict(P.parse_endpoint_model_payload(payload))
+check("rich upstream model retained", endpoint.get("hy3", {}).get("credits") == "x0.10", endpoint.get("hy3"))
+check("fast preset retained", endpoint.get("fast-model", {}).get("credits") == "x0.21", endpoint.get("fast-model"))
+check("balanced preset retained", endpoint.get("balanced-model", {}).get("credits") == "x0.65", endpoint.get("balanced-model"))
+check("deep preset retained", endpoint.get("deep-model", {}).get("credits") == "x1.20", endpoint.get("deep-model"))
+
+print()
+print("[9] product cache discovery merges root models and agent presets")
+cache = {
+    "models": [{"id": "hy3", "credits": "x0.11"}],
+    "agents": [{"models": [
+        {"id": "fast-model", "credits": "x0.21"},
+        {"id": "balanced-model", "credits": "x0.65"},
+        {"id": "deep-model", "credits": "x1.20"},
+    ]}],
+}
+cache_models = dict(P.parse_product_config_models(cache))
+check("product root model retained", cache_models.get("hy3", {}).get("credits") == "x0.11", cache_models.get("hy3"))
+check("product fast preset retained", "fast-model" in cache_models, cache_models)
+check("product deep preset retained", "deep-model" in cache_models, cache_models)
+
+print()
+print("[10] sync persists filtered models as hidden without exposing them")
+wb_settings.set_model_config(TMP, "cn", ["old-hidden"], ["hy3", "fast-model"])
+state = P.sync_model_config(
+    wb_settings.model_config(TMP),
+    "cn",
+    [("hy3", {}), ("fast-model", {}), ("balanced-model", {}), ("deep-model", {})],
+    [("hy3", {}), ("fast-model", {}), ("balanced-model", {}), ("deep-model", {}), ("internal-only", {})],
+)
+check("newly discovered preset visible", "balanced-model" in state["visible"], state)
+check("filtered model hidden", "internal-only" in state["hidden"], state)
+check("previous manual hidden retained", "old-hidden" in state["hidden"], state)
+check("order starts with previous order", state["order"][:2] == ["hy3", "fast-model"], state["order"])
+persisted = wb_settings.model_config(TMP)["cn"]
+check("sync persisted hidden list", "internal-only" in persisted["hidden"], persisted)
+
+print()
+print("[11] official-style environment still exposes presets on sync")
+wb_settings.set_model_config(TMP, "cn", [], [])
+state = P.sync_model_config(
+    wb_settings.model_config(TMP),
+    "cn",
+    [("hy3", {})],
+    [("hy3", {}), ("hy3-x", {}), ("fast-model", {}), ("balanced-model", {}), ("deep-model", {})],
+)
+for alias in ("fast-model", "balanced-model", "deep-model"):
+    check(alias + " stays visible", alias in state["visible"], state)
+check("non-preset env-filtered model stays hidden", "hy3-x" in state["hidden"], state)
+
+print()
+print("[12] saved order can expose a preset through WB_MODEL_SET=official")
+os.environ["WB_MODEL_SET"] = "official"
+try:
+    wb_settings.set_model_config(TMP, "cn", [], ["hy3", "fast-model", "balanced-model", "deep-model"])
+    picked = [mid for mid, _ in P.wb_patch_pick(
+        P.merge_catalog([
+            ("hy3", {}), ("fast-model", {}), ("balanced-model", {}), ("deep-model", {}),
+        ], realm="cn"), "cn")]
+    for alias in ("fast-model", "balanced-model", "deep-model"):
+        check(alias + " passes official filter", alias in picked, picked)
+    check("stock model remains", "hy3" in picked, picked)
+finally:
+    os.environ.pop("WB_MODEL_SET", None)
+
+print()
 print("PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
