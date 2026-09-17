@@ -24,3 +24,7 @@ desktop.ini
 .idea/
 
 usage/*.bak*
+
+# 历史补丁/备份残留（已不再使用 hub_patch.py）
+*.orig
+*.bak.*

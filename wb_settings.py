@@ -321,6 +321,58 @@ def account_aliases(accounts_dir):
     return out
 
 
+def model_config(accounts_dir):
+    """# PATCH(wb-hub-model-config) 面板可配置的模型列表：按 realm 存 hidden / order。
+
+    返回 {"intl": {"hidden": [...], "order": [...]}, "cn": {...}}，缺省为空。
+    - hidden: 需要从列表隐藏的模型 id
+    - order : 期望的展示顺序（未列出的按默认顺序追加）
+    """
+    data = load(accounts_dir)
+    raw = data.get("model_config")
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    for realm in ("intl", "cn"):
+        entry = raw.get(realm)
+        if not isinstance(entry, dict):
+            continue
+        hidden = [str(x).strip() for x in (entry.get("hidden") or [])
+                  if str(x).strip()]
+        order = [str(x).strip() for x in (entry.get("order") or [])
+                 if str(x).strip()]
+        out[realm] = {"hidden": hidden, "order": order}
+    return out
+
+
+def set_model_config(accounts_dir, realm, hidden, order):
+    """# PATCH(wb-hub-model-config) 整体覆盖某个 realm 的模型显隐/顺序配置。"""
+    realm = str(realm or "").strip().lower()
+    if realm not in ("intl", "cn"):
+        raise ValueError("realm must be intl or cn")
+    data = load(accounts_dir)
+    raw = data.get("model_config")
+    if not isinstance(raw, dict):
+        raw = {}
+    seen = set()
+    clean_hidden = []
+    for x in (hidden or []):
+        v = str(x).strip()
+        if v and v not in seen:
+            seen.add(v)
+            clean_hidden.append(v)
+    clean_order, seen2 = [], set()
+    for x in (order or []):
+        v = str(x).strip()
+        if v and v not in seen2:
+            seen2.add(v)
+            clean_order.append(v)
+    raw[realm] = {"hidden": clean_hidden, "order": clean_order}
+    data["model_config"] = raw
+    save(accounts_dir, data)
+    return raw[realm]
+
+
 def set_account_aliases(accounts_dir, mapping):
     """整体覆盖别名表（面板每次提交全量）。"""
     data = load(accounts_dir)

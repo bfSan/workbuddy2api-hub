@@ -905,6 +905,33 @@ def runtime_settings_view():
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
         "version": "1.2.0",
     }
+def models_config_view():
+    """# PATCH(wb-hub-model-config) 面板模型配置视图。
+
+    返回每个 realm 的「合并后全量池」以及当前 hidden/order，供前端渲染
+    隐藏开关、排序与「从全量池恢复」列表。
+    """
+    cfg = wb_settings.model_config(ACCOUNTS_DIR)
+    out = {}
+    for realm in ("intl", "cn"):
+        try:
+            entries = merge_catalog([], realm=realm)
+            if realm == "intl":
+                live = fetch_endpoint_models()
+                if live:
+                    entries = merge_catalog(live, realm=realm)
+        except Exception:
+            entries = merge_catalog([], realm=realm)
+        pool_ids = [mid for mid, _ in entries if mid]
+        entry = cfg.get(realm) or {}
+        out[realm] = {
+            "pool": pool_ids,
+            "hidden": entry.get("hidden") or [],
+            "order": entry.get("order") or [],
+        }
+    return {"ok": True, "realms": out}
+
+
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
     return POOL.representative() if POOL else None
@@ -1131,7 +1158,7 @@ def merge_catalog(primary, realm=None):
         if mid not in seen:
             out.append((mid, meta))
     return out
-def wb_patch_pick(entries, r):
+def _wb_patch_pick_env(entries, r):
     """# PATCH(wb-hub-curated-models) 精选模型列表：只暴露 WB_MODEL_PREFIXES 里的前缀。
 
     - WB_MODEL_PREFIXES  逗号分隔的前缀，如 "hy4,gpt"；留空 = 不过滤（返回全量）
@@ -1172,6 +1199,36 @@ def wb_patch_pick(entries, r):
         out.append((mid, meta))
     order = CN_UI_ORDER if r == "cn" else INTL_UI_ORDER
     out.sort(key=lambda kv: order.index(kv[0]) if kv[0] in order else len(order))
+    return out
+
+
+
+def wb_patch_model_config(r):
+    """# PATCH(wb-hub-model-config) 面板配置的模型显隐/顺序（settings.json）。"""
+    try:
+        cfg = wb_settings.model_config(ACCOUNTS_DIR)
+        return cfg.get(r) or {}
+    except Exception:
+        return {}
+
+
+def wb_patch_pick(entries, r):
+    """# PATCH(wb-hub-model-config) 在环境变量筛选之上，叠加面板可配置的显隐/排序。
+
+    - hidden: 从列表移除这些 model id
+    - order : 期望顺序；未列出的沿用原顺序追加在后
+    面板未配置时行为与旧版完全一致（环境变量 WB_MODEL_SET / WB_MODEL_PREFIXES 仍然生效）。
+    """
+    base = _wb_patch_pick_env(entries, r)
+    cfg = wb_patch_model_config(r)
+    hidden = set(cfg.get("hidden") or [])
+    order = cfg.get("order") or []
+    if not hidden and not order:
+        return base
+    out = [(mid, meta) for mid, meta in base if mid and mid not in hidden]
+    if order:
+        rank = {m: i for i, m in enumerate(order)}
+        out.sort(key=lambda kv: rank.get(kv[0], len(order)))
     return out
 
 
@@ -1307,7 +1364,8 @@ def fetch_models(realm=None):
             return c["data"]
     live = read_product_config_models(realm=r)
     if not live and r == "intl":
-        live = [(m, {}) for m in fetch_endpoint_models()]
+        # Live upstream list carries per-model metadata (credits/multiplier,...)
+        live = fetch_endpoint_models()
     entries = merge_catalog(live, realm=r)
     entries = wb_patch_pick(entries, r)
     with _lock:
@@ -1445,12 +1503,29 @@ def read_product_config_models(realm=None):
         if isinstance(mid, str) and mid:
             out.append((mid, m))
     return out
+# Upstream capability/metadata fields we care to forward from the personal
+# models endpoint so nothing has to be hard-coded locally (notably `credits`,
+# the live per-model multiplier shown on the dashboard).
+UPSTREAM_MODEL_META_KEYS = (
+    "credits", "name", "descriptionEn", "descriptionZh",
+    "maxInputTokens", "maxOutputTokens", "maxAllowedSize",
+    "supportsImages", "supportsToolCall", "supportsReasoning",
+    "onlyReasoning", "reasoning", "tags", "vendor", "isDefault",
+)
+
+
 def fetch_endpoint_models():
+    """Live model list from upstream: [(id, meta), ...].
+
+    `meta` carries the upstream-provided metadata (including `credits`, the
+    live multiplier) so the dashboard shows the real upstream rate instead of
+    a hard-coded copy. Falls back to the in-memory cache when unavailable.
+    """
     account = POOL.pick(realm="intl") if POOL else None
     if account is None:
         log("model discovery skipped: no usable account")
         cached = _models_cache.get("intl", {}).get("data")
-        return [m for m, _ in (cached or [])]
+        return list(cached or [])
     req = urllib.request.Request(UPSTREAM + MODELS_PATH, method="GET", headers=account.headers())
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -1458,14 +1533,21 @@ def fetch_endpoint_models():
     except Exception as exc:
         log(f"model discovery failed: {exc}")
         cached = _models_cache.get("intl", {}).get("data")
-        return [m for m, _ in (cached or [])]
-    ids, seen = [], set()
+        return list(cached or [])
+    out, seen = [], set()
     for agent in (payload.get("data") or {}).get("agents") or []:
-        for mid in agent.get("models") or []:
-            if mid not in seen:
-                seen.add(mid)
-                ids.append(mid)
-    return ids
+        for entry in agent.get("models") or []:
+            # Upstream entries are usually dicts, but tolerate bare ids too.
+            if isinstance(entry, dict):
+                mid = entry.get("id")
+                meta = {k: entry[k] for k in UPSTREAM_MODEL_META_KEYS if k in entry}
+            else:
+                mid, meta = entry, {}
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+            out.append((mid, meta))
+    return out
 def strip_data_prefix(line):
     line = line.strip()
     # SSE comment / heartbeat / keepalive / empty line
@@ -1807,6 +1889,7 @@ def build_upstream_body(payload):
         body["stream_options"] = {"include_usage": True}
     return body
 def open_upstream(payload, session_key=None, target_realm=None, allow=None):
+    model = payload.get("model") or ""
     realm = target_realm or detect_model_realm(payload.get("model")) or CURRENT_REALM
     upstream_body = build_upstream_body(payload)
     body = json.dumps(upstream_body, ensure_ascii=False).encode("utf-8")
@@ -1830,7 +1913,7 @@ def open_upstream(payload, session_key=None, target_realm=None, allow=None):
     tried = set()
     last_error = None
     for _ in range(total):
-        account = POOL.pick_for_session(realm=realm, session_key=session_key, exclude=tried) if POOL else None
+        account = POOL.pick_for_session(realm=realm, session_key=session_key, exclude=tried, model=model) if POOL else None
         if account is None:
             break
         if account.realm != realm:
@@ -1848,23 +1931,27 @@ def open_upstream(payload, session_key=None, target_realm=None, allow=None):
                                      headers=account.headers(purpose="chat"))
         try:
             resp = urllib.request.urlopen(req, timeout=600)
-            account.clear_error()
+            # 成功：清掉这个模型的冷却（其它模型的冷却保留），并解除账号级冷却
+            account.clear_error(model=model)
             return resp, account
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403, 429):
                 log("account %s rejected (HTTP %s), rotating" % (account.uid[:8], exc.code))
                 if session_key and POOL:
                     POOL.affinity.unbind(session_key)
+                # 429 = 该模型限流：只冻结这个模型，账号仍可服务其它模型；
+                # 401/403 = 账号/令牌问题：整个账号冷却。
                 account.note_error("HTTP %s" % exc.code,
                                    cooldown=300 if exc.code == 429 else 60,
-                                   single_account=(total <= 1))
+                                   single_account=(total <= 1), model=model,
+                                   account_wide=(exc.code != 429))
                 last_error = exc
                 continue
             raise
         except Exception as exc:
             if session_key and POOL:
                 POOL.affinity.unbind(session_key)
-            account.note_error(str(exc)[:120], cooldown=60, single_account=(total <= 1))
+            account.note_error(str(exc)[:120], cooldown=60, single_account=(total <= 1), model=model, account_wide=True)
             last_error = exc
             continue
     if last_error is not None:
@@ -3079,6 +3166,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self._authorized():
                 return
             return self._json(200, runtime_settings_view())
+        if path == "/settings/models":
+            if not self._panel_ok():
+                return self._error(401, "panel password required", "invalid_request_error")
+            return self._json(200, models_config_view())
         if path == "/logs":
             if not self._authorized():
                 return
@@ -3233,6 +3324,24 @@ class Handler(BaseHTTPRequestHandler):
             API_KEY = new_key
             API_KEY_FILE_SET = True
             reply["api_key_set"] = bool(new_key)
+        if "model_config" in payload:
+            mc = payload.get("model_config")
+            if not isinstance(mc, dict):
+                return self._error(400, "model_config must be an object", "invalid_request_error")
+            saved = {}
+            for realm, entry in mc.items():
+                realm = str(realm or "").strip().lower()
+                if realm not in ("intl", "cn"):
+                    return self._error(400, "model_config realm must be intl or cn",
+                                       "invalid_request_error")
+                entry = entry if isinstance(entry, dict) else {}
+                saved[realm] = wb_settings.set_model_config(
+                    ACCOUNTS_DIR, realm, entry.get("hidden"), entry.get("order"))
+            # 让下一次 /v1/models 立刻反映新配置
+            with _lock:
+                _models_cache["intl"] = {"at": 0.0, "data": None}
+                _models_cache["cn"] = {"at": 0.0, "data": None}
+            reply["model_config_saved"] = saved
         if payload.get("restart_scheduler"):
             if SCHEDULER:
                 SCHEDULER.stop()
