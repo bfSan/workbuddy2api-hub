@@ -28,3 +28,7 @@ usage/*.bak*
 # 历史补丁/备份残留（已不再使用 hub_patch.py）
 *.orig
 *.bak.*
+
+# 本地打包产物（部署归档不应进入源码仓库）
+dist/
+.venv/
