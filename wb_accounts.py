@@ -646,25 +646,34 @@ class AccountPool(object):
             snapshot = [a for a in self.accounts if not realm or a.realm == realm]
         return sum(1 for a in snapshot if a.enabled and a.access_token)
 
-    def pick_for_session(self, realm=None, session_key=None, exclude=None, model=None):
+    def pick_for_session(self, realm=None, session_key=None, exclude=None, model=None,
+                         allow=None):
         exclude = exclude or set()
+        allow = set(allow) if allow is not None else None
         if session_key:
             bound_uid = self.affinity.get(session_key)
             if bound_uid and bound_uid not in exclude:
                 account = self.get(bound_uid)
                 # skip the bound account if it is cooling down for this model
-                if account and account.realm == realm and account.ready(model=model):
+                if (account and account.realm == realm
+                        and (allow is None or account.uid in allow)
+                        and account.ready(model=model)):
                     return account
                 self.affinity.unbind(session_key)
-        account = self.pick(realm=realm, exclude=exclude, model=model)
+        account = self.pick(realm=realm, exclude=exclude, model=model, allow=allow)
         if account and session_key:
             self.affinity.bind(session_key, account.uid)
         return account
 
-    def pick(self, realm=None, exclude=None, model=None):
+    def pick(self, realm=None, exclude=None, model=None, allow=None):
         exclude = exclude or set()
+        allow = set(allow) if allow is not None else None
         with self._lock:
-            snapshot = [a for a in self.accounts if not realm or a.realm == realm]
+            snapshot = [
+                a for a in self.accounts
+                if (not realm or a.realm == realm)
+                and (allow is None or a.uid in allow)
+            ]
             start = self._cursor
         total = len(snapshot)
         if total == 0: return None
@@ -1027,4 +1036,3 @@ def normalise_import_row(row, realm=None):
         "lastError": "",
         "cooldownUntil": 0.0,
     }
-

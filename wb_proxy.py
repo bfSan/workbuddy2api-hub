@@ -2135,29 +2135,27 @@ def open_upstream(payload, session_key=None, target_realm=None, allow=None):
         if session_key and AFFINITY_DEBUG:
             log("affinity: derived %s for %d msgs"
                 % (session_key, len(upstream_body.get("messages") or [])))
-    total = max(1, POOL.count_ready(realm)) if POOL else 1
-    # PATCH(wb-hub-cooloff-scope) 冷却时长要按「这个 Key 真正用得上的号」算，不能拿全局 ready 数。
-    # 只有 1 个可用号时让 note_error 走 3 秒短冷却，避免一次 429 就把该 Key 冻死 5 分钟。
-    if POOL and allow:
-        _allowed = sum(1 for _a in POOL.accounts
-                       if _a.uid in allow and _a.realm == realm
-                       and _a.enabled and _a.access_token)
-        if _allowed:
-            total = _allowed
+    # PATCH(wb-hub-cooloff-scope) 尝试次数必须按「这个 Key 真正用得上的号」算。
+    # 选择器也直接接收 allow，避免非白名单账号被选中后白耗一次轮换机会。
+    if POOL:
+        total = sum(
+            1 for _a in POOL.accounts
+            if _a.realm == realm
+            and (allow is None or _a.uid in allow)
+            and _a.ready(model=model)
+        )
+    else:
+        total = 0
+    total = max(1, total)
     tried = set()
     last_error = None
     for _ in range(total):
-        account = POOL.pick_for_session(realm=realm, session_key=session_key, exclude=tried, model=model) if POOL else None
+        account = POOL.pick_for_session(
+            realm=realm, session_key=session_key, exclude=tried, model=model,
+            allow=allow,
+        ) if POOL else None
         if account is None:
             break
-        if account.realm != realm:
-            if session_key and POOL: POOL.affinity.unbind(session_key)
-            continue
-        # PATCH(wb-hub-key-accounts) 越界的号直接跳过并拉黑，交还给轮询找下一个
-        if allow is not None and account.uid not in allow:
-            if session_key and POOL: POOL.affinity.unbind(session_key)
-            tried.add(account.uid)
-            continue
         tried.add(account.uid)
         cfg = wb_accounts.get_realm_config(account.realm)
         chat_url = cfg["chat_upstream"] + CHAT_PATH

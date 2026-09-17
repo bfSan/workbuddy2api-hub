@@ -6,6 +6,7 @@ model freezes only that model, leaving the account usable for other models.
 import os
 import sys
 import time
+import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -81,6 +82,82 @@ check("balanced preset passes through", P.resolve_preset_model("balanced-model")
 check("deep preset passes through", P.resolve_preset_model("deep-model") == "deep-model")
 check("normal model passes through", P.resolve_preset_model("hy3") == "hy3")
 check("preset keeps requested id in usage", P.usage_model_label("fast-model", "hy3") == "fast-model")
+
+print()
+print("[6] account allow-list is applied before selection")
+pool = wb_accounts.AccountPool(".")
+blocked = mk_account(uid="blocked", token="tok")
+preferred = mk_account(uid="preferred", token="tok")
+pool.accounts = [blocked, preferred]
+pool._cursor = 0  # the cursor starts on the non-allow-listed account
+check("allowed account selected from blocked cursor",
+      pool.pick(realm="cn", model="deepseek-v4.1-flash",
+                allow={"preferred"}).uid == "preferred")
+check("non-allowed account never returned",
+      pool.pick(realm="cn", model="deepseek-v4.1-flash",
+                allow={"preferred"}).uid != "blocked")
+
+print()
+print("[7] allowed account rotates after a model-scoped 429")
+allowed = {"first", "second"}
+first = mk_account(uid="first", token="tok")
+second = mk_account(uid="second", token="tok")
+pool.accounts = [first, second]
+pool._cursor = 0
+picked = pool.pick(realm="cn", model="deepseek-v4.1-flash", allow=allowed)
+check("first allowed account selected", picked.uid == "first")
+first.note_error("HTTP 429", cooldown=300, model="deepseek-v4.1-flash",
+                 account_wide=False)
+picked_next = pool.pick(realm="cn", exclude={"first"},
+                        model="deepseek-v4.1-flash", allow=allowed)
+check("second allowed account is next after 429", picked_next.uid == "second")
+
+print()
+print("[8] open_upstream retries the next allow-listed account after HTTP 429")
+outsider = mk_account(uid="outsider", token="tok")
+first = mk_account(uid="first", token="tok")
+second = mk_account(uid="second", token="tok")
+pool.accounts = [outsider, first, second]
+pool._cursor = 0  # original bug: the outsider consumed the first retry slot
+original_pool = P.POOL
+original_urlopen = P.urllib.request.urlopen
+calls = []
+
+
+def fake_urlopen(req, timeout=None):
+    auth = req.get_header("Authorization") or ""
+    uid = req.get_header("X-user-id") or ""
+    calls.append(uid)
+    if auth == "Bearer tok":
+        # Both accounts share this token in the harness, so distinguish by uid.
+        if uid == "first":
+            raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests",
+                                         {}, None)
+    return "upstream-response"
+
+
+try:
+    first = mk_account(uid="first", token="tok")
+    second = mk_account(uid="second", token="tok")
+    pool.accounts = [outsider, first, second]
+    pool._cursor = 0
+    P.POOL = pool
+    P.urllib.request.urlopen = fake_urlopen
+    response, selected = P.open_upstream(
+        {"model": "deepseek-v4.1-flash",
+         "messages": [{"role": "user", "content": "ping"}]},
+        target_realm="cn",
+        allow={"first", "second"},
+    )
+    check("open_upstream returns the second account", selected.uid == "second",
+          selected.uid)
+    check("open_upstream retried after the first 429", len(calls) == 2, calls)
+    check("non-allow-listed account was never called",
+          all(call in ("first", "second") for call in calls), calls)
+    check("open_upstream returned upstream response", response == "upstream-response")
+finally:
+    P.urllib.request.urlopen = original_urlopen
+    P.POOL = original_pool
 
 print()
 print("PASS=%d FAIL=%d" % (PASS, FAIL))
