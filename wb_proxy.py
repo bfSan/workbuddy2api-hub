@@ -460,6 +460,13 @@ _snap_cache = {}
 _snap_lock = threading.Lock()
 
 
+def account_display_name(uid, nickname=None, alias=None):
+    """Resolve the panel-facing account name consistently across endpoints."""
+    uid = str(uid or "")
+    alias = str(alias or "").strip() or wb_patch_account_aliases().get(uid, "")
+    return alias or str(nickname or "").strip() or (uid[:8] if uid else "")
+
+
 def usage_snapshot(realm=None, ttl=10):
     """Cached wrapper: the dashboard polls this every few seconds."""
     r = realm or CURRENT_REALM
@@ -515,9 +522,23 @@ def _usage_snapshot_uncached(realm=None):
     snap["since"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(snap.get("started", time.time())))
     snap["log_file"] = USAGE_LOG
     snap["realm"] = r
-    snap["accounts_map"] = {a.uid: {"nickname": a.nickname, "realm": a.realm} for a in POOL.accounts} if POOL else {}
+    aliases = wb_patch_account_aliases()
+    snap["accounts_map"] = {
+        a.uid: {
+            "nickname": a.nickname,
+            "alias": aliases.get(a.uid) or "",
+            "name": account_display_name(a.uid, a.nickname, aliases.get(a.uid)),
+            "realm": a.realm,
+        }
+        for a in POOL.accounts
+    } if POOL else {}
+    rep_uid = rep.uid if rep else ""
+    rep_alias = aliases.get(rep_uid) or ""
     snap["account"] = {
-        "uid": (rep.uid if rep else ""),
+        "uid": rep_uid,
+        "nickname": (rep.nickname if rep else ""),
+        "alias": rep_alias,
+        "name": account_display_name(rep_uid, rep.nickname if rep else "", rep_alias),
         "domain": (rep.domain if rep else ""),
         "issuer": (wb_accounts.jwt_issuer(rep.access_token) if rep else ""),
         "credential_file": (os.path.basename(rep.path) if rep and rep.path else ""),
@@ -619,6 +640,13 @@ def recent_usage(limit=100, realm=None):
         if realm and not row_matches_realm(item, realm):
             continue
         rows.append(item)
+    aliases = wb_patch_account_aliases()
+    nickname_map = {a.uid: a.nickname for a in POOL.accounts} if POOL else {}
+    for row in rows:
+        uid = row.get("account") or ""
+        alias = aliases.get(uid) or ""
+        row["account_alias"] = alias
+        row["account_name"] = account_display_name(uid, nickname_map.get(uid), alias)
     return {"total": count_usage_rows(realm), "rows": rows[-limit:]}
 POOL = None
 SCHEDULER = None
@@ -891,6 +919,8 @@ def runtime_settings_view():
             _acct_opts.append({
                 "uid": _a.get("uid") or "",
                 "nickname": _a.get("nickname") or (_a.get("uid") or "")[:8],
+                "alias": _a.get("alias") or "",
+                "name": account_display_name(_a.get("uid"), _a.get("nickname"), _a.get("alias")),
                 "realm": _a.get("realm") or "",
             })
     except Exception:
@@ -3400,7 +3430,16 @@ class Handler(BaseHTTPRequestHandler):
             from wb_tasks import fetch_growth_tasks, fetch_growth_summary
             tasks = fetch_growth_tasks(acc)
             summary = fetch_growth_summary(acc)
-            acct_list = [{"uid": a.uid, "nickname": a.nickname or a.uid[:8]} for a in cn_accounts]
+            aliases = wb_patch_account_aliases()
+            acct_list = [
+                {
+                    "uid": a.uid,
+                    "nickname": a.nickname or a.uid[:8],
+                    "alias": aliases.get(a.uid) or "",
+                    "name": account_display_name(a.uid, a.nickname, aliases.get(a.uid)),
+                }
+                for a in cn_accounts
+            ]
             return self._json(200, {
                 "tasks": tasks,
                 "summary": summary,

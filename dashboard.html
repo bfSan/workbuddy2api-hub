@@ -1003,9 +1003,20 @@ function accAlias(uid){
 function accName(a){
   if(!a) return '';
   if(a.alias) return a.alias;
+  if(a.name) return a.name;
   const byUid = accAlias(a.uid);
   if(byUid) return byUid;
   return a.nickname || (a.uid ? String(a.uid).slice(0, 8) : '');
+}
+
+function uidName(uid, fallback){
+  const id = String(uid || '');
+  const alias = accAlias(id);
+  if(alias) return alias;
+  if(fallback) return String(fallback);
+  const found = (window.ACCOUNTS || []).find(a => String(a.uid || '') === id);
+  if(found) return accName(found);
+  return id ? id.slice(0, 8) : '';
 }
 
 async function editAccountAlias(uid, current){
@@ -1019,6 +1030,8 @@ async function editAccountAlias(uid, current){
     window.ACCOUNT_ALIASES = map;
     await loadAccounts();
     if(typeof loadSettings === 'function') loadSettings(false);
+    if(currentMainTab === 'recent' && typeof refreshRecent === 'function') refreshRecent(false);
+    if(currentMainTab === 'analytics' && typeof loadAnalytics === 'function') loadAnalytics();
     toast('别名已保存', 'ok');
   }catch(e){
     toast('保存失败: ' + e.message, 'bad');
@@ -1462,6 +1475,7 @@ function accountRow(a){
   // JWT; treat it as untrusted and keep it to a safe charset.
   const uidAttr = esc(String(a.uid || '').replace(/[^\w.@-]/g, ''));
   const nameAttr = esc(String(a.nickname || '').replace(/["'\\<>]/g, ''));
+  const aliasAttr = esc(String(accAlias(a.uid) || a.alias || '').replace(/["'\\<>]/g, ''));
   const usage = USAGE_BY_ACCOUNT[a.uid] || {};
   const state = !a.enabled ? '<span class="badge off">已停用</span>'
               : a.inCooldown ? '<span class="badge warn">冷却 ' + (a.cooldownFor||0) + 's</span>'
@@ -1481,7 +1495,7 @@ function accountRow(a){
     + '<td style="text-align:center;white-space:nowrap">' + realmBadge + '</td>'
     + '<td style="text-align:left">'
     +   '<div style="font-weight:600;font-size:13px;color:var(--fg)">' + esc(accName(a)) + '</div>'
-    + '<div class="mono" style="color:var(--dim);font-size:11px">' + esc(a.uid.slice(0,8)) + ' · ' + esc(a.source) + ' · 到期 ' + esc(a.expiresIn || '?') + '</div>'
+    + '<div class="mono" style="color:var(--dim);font-size:11px">' + esc(String(a.uid || '').slice(0,8)) + ' · ' + esc(a.source) + ' · 到期 ' + esc(a.expiresIn || '?') + '</div>'
     + (a.machineId ? ('<div class="mono" style="color:var(--dim);font-size:10px;margin-top:2px" title="由账号UID稳定派生的专属设备码，防多号关联风控">设备码: ' + esc(a.machineId.slice(0,14)) + '...</div>') : '')
     + err + coolDetail + '</td>'
     + '<td style="text-align:center">' + state + '</td>'
@@ -1491,6 +1505,7 @@ function accountRow(a){
     + '<td style="text-align:right">' + fmt(usage.cached_tokens) + '</td>'
     + '<td style="text-align:right;white-space:nowrap">'
     + '<button class="sec mini" onclick="toggleAccount(&quot;' + uidAttr + '&quot;,' + (!a.enabled) + ', this)">' + (a.enabled ? '停用' : '启用') + '</button> '
+    + '<button class="sec mini" onclick="editAccountAlias(&quot;' + uidAttr + '&quot;,&quot;' + aliasAttr + '&quot;)">改备注</button> '
     + '<button class="sec mini" onclick="refreshOne(&quot;' + uidAttr + '&quot;, this)">刷新</button> '
     + '<button class="sec mini" onclick="exportOne(&quot;' + uidAttr + '&quot;)">导出</button> '
     + '<button class="danger mini" onclick="deleteAccount(&quot;' + uidAttr + '&quot;,&quot;' + nameAttr + '&quot;, this)">删除</button>'
@@ -1529,7 +1544,7 @@ function renderAccounts(){
     + '<th style="text-align:right;width:70px">请求</th>'
     + '<th style="text-align:right;width:88px">总 token</th>'
     + '<th style="text-align:right;width:80px">缓存</th>'
-    + '<th style="text-align:right;width:180px">操作</th>'
+    + '<th style="text-align:right;width:230px">操作</th>'
     + '</tr></thead><tbody>' + list.map(accountRow).join('') + '</tbody></table>'
     + '<div class="legend"><span>多个账号按会话粘性 + 轮询使用；某个账号被上游拒绝时自动切到下一个</span></div>';
 }
@@ -1987,7 +2002,7 @@ function renderRecent(){
     + last.map(r => '<tr>'
         + '<td class="mono">' + esc((r.iso||'').replace('T',' ').slice(5)) + '</td>'
         + '<td class="mono">' + esc(r.model) + (r.resolved_model && r.resolved_model !== r.model ? '<div style="font-size:10px;color:var(--dim)">' + esc(r.resolved_model) + '</div>' : '') + '</td>'
-        + '<td class="mono" style="font-size:11px;color:var(--dim)">' + esc((r.account||'—').slice(0,8)) + '</td>'
+        + '<td style="font-size:11px"><b>' + esc(r.account_name || uidName(r.account) || '—') + '</b><div class="mono" style="color:var(--dim);font-size:10px">' + esc((r.account||'—').slice(0,8)) + '</div></td>'
         + '<td><span class="badge ' + (r.stream?'s':'') + '">' + (r.stream?'流式':'非流式') + '</span></td>'
         + '<td>' + (r.error ? '<span class="badge bad">失败</span>' : (r.elapsed_ms!=null ? fmt(r.elapsed_ms)+' ms' : '—')) + '</td>'
         + '<td>' + (r.ttft_ms!=null ? fmt(r.ttft_ms)+' ms' : '—') + '</td>'
@@ -2019,7 +2034,7 @@ async function refreshInner(){
 
   const t = usage;
   document.getElementById('meta').innerHTML =
-    '账号 <b>' + esc((t.account && t.account.uid || '—').slice(0,8)) + '</b>'
+    '账号 <b>' + esc((t.account && (t.account.name || accName(t.account))) || uidName(t.account && t.account.uid) || '—') + '</b>'
     + (t.accounts ? ' · 池 <b>' + t.accounts_ready + '/' + t.accounts + '</b>' : '')
     + '<br>统计开始于 <b>' + esc(t.since || '—') + '</b> · 请求 <b>' + fmt(t.requests || 0) + '</b> 条';
   document.getElementById('logfile').textContent = t.log_file || '';
@@ -2113,13 +2128,13 @@ async function refreshInner(){
       if(acctEntries.length === 1){
         const [uid, count] = acctEntries[0];
         const info = acctsMap[uid] || {};
-        const name = esc(accName(info));
+        const name = esc(accName(info) || uidName(uid));
         const flag = info.realm === 'cn' ? '<span class="badge warn mini">🇨🇳</span>' : '<span class="badge s mini">🌐</span>';
         acctCell = '<b>' + name + '</b> ' + flag;
       } else if(acctEntries.length > 1){
         acctCell = acctEntries.map(([uid, count]) => {
           const info = acctsMap[uid] || {};
-          const name = esc(accName(info));
+          const name = esc(accName(info) || uidName(uid));
           const flag = info.realm === 'cn' ? '' : '';
           return '<span class="badge mini" style="margin:1px 2px">' + flag + ' ' + name + ' <span style="color:var(--dim)">(' + count + ')</span></span>';
         }).join('');
@@ -2426,7 +2441,7 @@ function keyAccountListHtml(index){
   }
   return opts.map(function(o){
     var uid = String(o.uid || '');
-    var label = (o.nickname || uid.slice(0, 8)) + (o.realm ? ' · ' + o.realm : '');
+    var label = accName(o) + (o.realm ? ' · ' + o.realm : '');
     return '<label style="display:flex;align-items:center;gap:8px;padding:6px 10px;font-size:12px;cursor:pointer">'
       + '<input type="checkbox"' + (picked.has(uid) ? ' checked' : '')
       + ` onchange="toggleKeyAccount(${index}, '${uid}', this.checked)">`
