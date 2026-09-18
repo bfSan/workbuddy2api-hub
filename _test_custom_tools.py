@@ -74,7 +74,28 @@ with contextlib.redirect_stdout(buf):
 check("no crash on unknown type", True)
 
 print()
-print("[4] non-streaming response: custom tool call is re-inflated")
+print("[4] parallel tool outputs stay contiguous across developer messages")
+parallel_hist = {"model": "m", "input": [
+    {"role": "user", "content": "inspect both"},
+    {"type": "function_call", "name": "get_weather", "call_id": "call_a",
+     "arguments": '{"city":"Beijing"}'},
+    {"type": "custom_tool_call", "name": "apply_patch", "call_id": "call_b",
+     "input": "*** Begin Patch\n+ok\n*** End Patch"},
+    {"type": "function_call_output", "call_id": "call_a", "output": "sunny"},
+    {"role": "developer", "content": "<notice-a>"},
+    {"type": "custom_tool_call_output", "call_id": "call_b", "output": "done"},
+    {"role": "developer", "content": "<notice-b>"},
+]}
+parallel_msgs = P.responses_to_chat(parallel_hist)["messages"]
+parallel_roles = [m["role"] for m in parallel_msgs]
+parallel_tool_ids = [m.get("tool_call_id") for m in parallel_msgs if m["role"] == "tool"]
+check("tool results remain adjacent",
+      parallel_roles == ["user", "assistant", "tool", "tool", "system", "system"],
+      parallel_roles)
+check("tool result order is preserved", parallel_tool_ids == ["call_a", "call_b"], parallel_tool_ids)
+
+print()
+print("[5] non-streaming response: custom tool call is re-inflated")
 chat_obj = {"choices": [{"finish_reason": "tool_calls", "message": {
     "role": "assistant", "content": "",
     "tool_calls": [{"id": "call_7", "type": "function", "function": {
@@ -87,7 +108,7 @@ check("input unwrapped verbatim, not JSON", item["input"] == "*** Begin Patch\n+
 check("call_id preserved", item["call_id"] == "call_7")
 
 print()
-print("[5] regression: ordinary function calls are unchanged")
+print("[6] regression: ordinary function calls are unchanged")
 chat_obj2 = {"choices": [{"finish_reason": "tool_calls", "message": {
     "role": "assistant", "content": "",
     "tool_calls": [{"id": "call_8", "type": "function", "function": {
@@ -99,7 +120,7 @@ check("arguments untouched", it2["arguments"] == '{"city":"Beijing"}')
 check("id still fc_ prefixed", it2["id"].startswith("fc_"), it2["id"])
 
 print()
-print("[6] streaming: custom tool emits custom_tool_call_input.* events")
+print("[7] streaming: custom tool emits custom_tool_call_input.* events")
 def chunk(delta, finish=None):
     return ("data: " + json.dumps({"choices": [{"delta": delta, "finish_reason": finish}]}) + "\n\n").encode()
 stream = [
@@ -125,7 +146,7 @@ custom_added = [a for a in added if a.get("item", {}).get("type") == "custom_too
 check("output_item.added uses custom_tool_call", len(custom_added) == 1)
 
 print()
-print("[7] streaming regression: ordinary function tool still uses function_call_arguments.*")
+print("[8] streaming regression: ordinary function tool still uses function_call_arguments.*")
 stream2 = [
     chunk({"tool_calls": [{"index": 0, "id": "call_10",
                            "function": {"name": "get_weather", "arguments": ""}}]}),
@@ -138,7 +159,7 @@ check("function_call_arguments.done present", "response.function_call_arguments.
 check("no custom events for a normal tool", "custom_tool_call_input" not in raw2)
 
 print()
-print("[8] aggregate_stream: empty tool_call placeholder fallback (Issue #15)")
+print("[9] aggregate_stream: empty tool_call placeholder fallback (Issue #15)")
 # Case A: upstream sends legacy function_call placeholder with finish_reason="tool_calls"
 stream_placeholder = [
     chunk({"content": "Hello!"}),

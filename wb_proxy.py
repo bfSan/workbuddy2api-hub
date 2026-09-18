@@ -2462,6 +2462,22 @@ def _unwrap_custom_input(args):
 def responses_to_chat(payload):
     """Translate a Responses API request body into a Chat Completions body."""
     messages = []
+    pending_tool_calls = set()
+    deferred_messages = []
+
+    def append_message(message):
+        if pending_tool_calls:
+            deferred_messages.append(message)
+        else:
+            messages.append(message)
+
+    def append_tool_output(message, call_id):
+        messages.append(message)
+        pending_tool_calls.discard(call_id)
+        if not pending_tool_calls and deferred_messages:
+            messages.extend(deferred_messages)
+            deferred_messages.clear()
+
     instructions = payload.get("instructions")
     if isinstance(instructions, str) and instructions.strip():
         messages.append({"role": "system", "content": instructions})
@@ -2492,7 +2508,7 @@ def responses_to_chat(payload):
                         else:
                             prev["content"] = body
                     else:
-                        messages.append({"role": role, "content": body})
+                        append_message({"role": role, "content": body})
             elif itype == "function_call_output":
                 raw_out = item.get("output")
                 if isinstance(raw_out, list):
@@ -2506,14 +2522,16 @@ def responses_to_chat(payload):
                     content = raw_out
                 else:
                     content = str(raw_out)
-                messages.append({
+                call_id = item.get("call_id") or ""
+                append_tool_output({
                     "role": "tool",
-                    "tool_call_id": item.get("call_id") or "",
+                    "tool_call_id": call_id,
                     "content": content,
-                })
+                }, call_id)
             elif itype == "function_call":
+                call_id = item.get("call_id") or item.get("id") or ""
                 tc_item = {
-                    "id": item.get("call_id") or item.get("id") or "",
+                    "id": call_id,
                     "type": "function",
                     "function": {
                         "name": item.get("name") or "",
@@ -2533,6 +2551,7 @@ def responses_to_chat(payload):
                         "content": "",
                         "tool_calls": [tc_item],
                     })
+                pending_tool_calls.add(call_id)
             elif itype == "custom_tool_call":
                 # Freeform tool call coming back as conversation history.
                 raw_input = item.get("input")
@@ -2540,8 +2559,9 @@ def responses_to_chat(payload):
                     raw_input = json.dumps(raw_input, ensure_ascii=False)
                 if not isinstance(raw_input, str):
                     raw_input = "" if raw_input is None else str(raw_input)
+                call_id = item.get("call_id") or item.get("id") or ""
                 tc_item = {
-                    "id": item.get("call_id") or item.get("id") or "",
+                    "id": call_id,
                     "type": "function",
                     "function": {
                         "name": item.get("name") or "",
@@ -2561,6 +2581,7 @@ def responses_to_chat(payload):
                         "content": "",
                         "tool_calls": [tc_item],
                     })
+                pending_tool_calls.add(call_id)
             elif itype == "custom_tool_call_output":
                 # Result of a freeform tool call (e.g. apply_patch output).
                 raw_out = item.get("output")
@@ -2572,11 +2593,12 @@ def responses_to_chat(payload):
                     content = raw_out
                 else:
                     content = str(raw_out)
-                messages.append({
+                call_id = item.get("call_id") or ""
+                append_tool_output({
                     "role": "tool",
-                    "tool_call_id": item.get("call_id") or "",
+                    "tool_call_id": call_id,
                     "content": content,
-                })
+                }, call_id)
             else:
                 # Never silently drop an unknown item: a dropped tool call or
                 # tool result leaves the transcript inconsistent upstream.
