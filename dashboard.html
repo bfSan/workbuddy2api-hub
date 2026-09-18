@@ -1088,6 +1088,7 @@ async function loadKeyUsage(){
     };
     var totalReq = sumField('requests');
     var totalErrors = sumField('errors');
+    var totalCredit = sumField('credit');
     var totalPrompt = sumField('prompt_tokens');
     var totalCached = sumField('cached_tokens');
     var totalTok = sumField('total_tokens');
@@ -1097,8 +1098,10 @@ async function loadKeyUsage(){
     var wallAvg = weightedAvg('elapsed_ms_avg');
     var summary = '<tr style="background:rgba(37,99,235,.06);font-weight:600">'
       + '<td><b>全部 API Key 合计 (Total)</b></td>'
-      + '<td><span style="color:var(--dim)">全部模型 / 账号</span></td>'
+      + '<td><span style="color:var(--dim)">全部模型</span></td>'
       + '<td>' + fmt(totalReq) + (totalErrors ? ' <span class="badge bad mini">' + totalErrors + ' 失败</span>' : '') + '</td>'
+      + '<td><b style="color:var(--accent2)">' + totalCredit.toFixed(2) + '</b></td>'
+      + '<td><b>' + pct(totalReq + totalErrors ? totalReq * 100 / (totalReq + totalErrors) : 0) + '</b></td>'
       + '<td><b style="color:var(--accent)">' + fmt(totalTok) + '</b></td>'
       + '<td>' + fmt(totalPrompt) + ' / ' + fmt(sumField('completion_tokens'))
       + (sumField('reasoning_tokens') ? ' (<span style="color:var(--think)">' + fmt(sumField('reasoning_tokens')) + '</span>)' : '')
@@ -1110,15 +1113,13 @@ async function loadKeyUsage(){
       + '<td>100%</td>'
       + '</tr>';
     body.innerHTML = '<table class="tbl"><thead><tr>'
-      + '<th>API Key</th><th>模型 / 账号</th><th>请求数</th><th>总 Token</th><th>输入 / 输出 (思考)</th>'
-      + '<th>首字延迟 (TTFT)</th><th>生成速度</th><th>端到端耗时</th><th>缓存命中率</th><th>用量占比</th>'
+      + '<th>API Key</th><th>模型</th><th>请求数</th><th>积分</th><th>成功率</th>'
+      + '<th>总 Token</th><th>输入 / 输出 (思考)</th><th>首字延迟 (TTFT)</th>'
+      + '<th>生成速度</th><th>端到端耗时</th><th>缓存命中率</th><th>用量占比</th>'
       + '</tr></thead><tbody>'
       + summary
       + rows.map(function(k){
           var models = Object.keys(k.models || {}).slice(0, 3).join('、');
-          var accts = Object.keys(k.accounts || {}).map(function(u){
-            return (accName({uid: u}) || String(u).slice(0, 8)) + ' (' + k.accounts[u] + ')';
-          }).join('、') || '-';
           var pctTok = Math.round((k.total_tokens || 0) / maxTok * 100);
           var ttft = k.ttft_ms_avg ? (ms(k.ttft_ms_avg) + ' <span style="color:var(--dim);font-size:11px">(P50 ' + ms(k.ttft_ms_p50) + ')</span>') : '—';
           var speed = k.tokens_per_sec_avg ? '<b style="color:var(--accent2)">' + k.tokens_per_sec_avg.toFixed(1) + '</b> <span style="font-size:11px;color:var(--dim)">tok/s</span>' : '—';
@@ -1126,13 +1127,11 @@ async function loadKeyUsage(){
           return '<tr>'
             + '<td><b>' + esc(k.label || '(未命名)') + '</b>'
             + (k.key_id ? ' <span class="mono" style="color:var(--dim);font-size:11px">' + esc(k.key_id) + '</span>' : '')
-            + '<div style="font-size:11px;color:var(--accent2)">积分 ' + (k.credit || 0).toFixed(2)
-            + ' · 成功率 ' + pct(k.success_rate_pct || 0) + (k.errors ? ' · ' + k.errors + ' 失败' : '') + '</div>'
             + '</td>'
-            + '<td style="font-size:11px">'
-            + (models ? '<div class="mono">' + esc(models) + '</div>' : '')
-            + '<div style="color:var(--dim)">' + esc(accts) + '</div></td>'
+            + '<td class="mono" style="font-size:11px">' + (models ? esc(models) : '—') + '</td>'
             + '<td>' + fmt(k.requests) + '</td>'
+            + '<td><b style="color:var(--accent2)">' + (k.credit || 0).toFixed(2) + '</b></td>'
+            + '<td>' + pct(k.success_rate_pct || 0) + (k.errors ? ' <span class="badge bad mini">' + k.errors + ' 失败</span>' : '') + '</td>'
             + '<td><b>' + fmt(k.total_tokens) + '</b></td>'
             + '<td>' + fmt(k.prompt_tokens) + ' / ' + fmt(k.completion_tokens)
             + (k.reasoning_tokens ? ' (<span style="color:var(--think)">' + fmt(k.reasoning_tokens) + '</span>)' : '') + '</td>'
