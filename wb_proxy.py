@@ -1476,9 +1476,8 @@ def usage_by_key(log_path=None, configured=None):
                     "requests": 0, "errors": 0, "prompt_tokens": 0,
                     "completion_tokens": 0, "reasoning_tokens": 0,
                     "cached_tokens": 0, "total_tokens": 0, "credit": 0.0,
-                    "ttft_ms_sum": 0.0, "ttft_n": 0,
-                    "speed_sum": 0.0, "speed_n": 0,
-                    "elapsed_ms_sum": 0.0, "elapsed_n": 0,
+                    "ttft_ms": [], "tokens_per_sec": [],
+                    "elapsed_ms": [],
                     "models": {}, "accounts": {},
                 })
                 if row.get("error"):
@@ -1493,14 +1492,11 @@ def usage_by_key(log_path=None, configured=None):
                 except (TypeError, ValueError):
                     pass
                 if row.get("ttft_ms") is not None:
-                    bucket["ttft_ms_sum"] += row.get("ttft_ms") or 0
-                    bucket["ttft_n"] += 1
+                    bucket["ttft_ms"].append(row["ttft_ms"])
                 if row.get("tokens_per_sec") is not None:
-                    bucket["speed_sum"] += row.get("tokens_per_sec") or 0
-                    bucket["speed_n"] += 1
+                    bucket["tokens_per_sec"].append(row["tokens_per_sec"])
                 if row.get("elapsed_ms") is not None:
-                    bucket["elapsed_ms_sum"] += row.get("elapsed_ms") or 0
-                    bucket["elapsed_n"] += 1
+                    bucket["elapsed_ms"].append(row["elapsed_ms"])
                 model = row.get("model") or "?"
                 bucket["models"][model] = bucket["models"].get(model, 0) + 1
                 acct = row.get("account") or "(unattributed)"
@@ -1520,21 +1516,20 @@ def usage_by_key(log_path=None, configured=None):
                 "requests": 0, "errors": 0, "prompt_tokens": 0,
                 "completion_tokens": 0, "reasoning_tokens": 0,
                 "cached_tokens": 0, "total_tokens": 0, "credit": 0.0,
-                "ttft_ms_sum": 0.0, "ttft_n": 0,
-                "speed_sum": 0.0, "speed_n": 0,
-                "elapsed_ms_sum": 0.0, "elapsed_n": 0,
+                "ttft_ms": [], "tokens_per_sec": [], "elapsed_ms": [],
                 "models": {}, "accounts": {},
             }
     for bucket in buckets.values():
         total = bucket["requests"] + bucket["errors"]
         bucket["success_rate_pct"] = round(bucket["requests"] * 100.0 / total, 1) if total else 0.0
         bucket["cache_hit_pct"] = round(bucket["cached_tokens"] * 100.0 / bucket["prompt_tokens"], 1) if bucket["prompt_tokens"] else 0.0
-        bucket["ttft_ms_avg"] = round(bucket["ttft_ms_sum"] / bucket["ttft_n"]) if bucket["ttft_n"] else 0
-        bucket["tokens_per_sec_avg"] = round(bucket["speed_sum"] / bucket["speed_n"], 1) if bucket["speed_n"] else 0.0
-        bucket["elapsed_ms_avg"] = round(bucket["elapsed_ms_sum"] / bucket["elapsed_n"]) if bucket["elapsed_n"] else 0
-        bucket.pop("ttft_ms_sum", None); bucket.pop("ttft_n", None)
-        bucket.pop("speed_sum", None); bucket.pop("speed_n", None)
-        bucket.pop("elapsed_ms_sum", None); bucket.pop("elapsed_n", None)
+        bucket["ttft_ms_avg"] = round(sum(bucket["ttft_ms"]) / len(bucket["ttft_ms"])) if bucket["ttft_ms"] else 0
+        bucket["ttft_ms_p50"] = _pct(bucket["ttft_ms"], 50) or 0
+        bucket["tokens_per_sec_avg"] = round(sum(bucket["tokens_per_sec"]) / len(bucket["tokens_per_sec"]), 1) if bucket["tokens_per_sec"] else 0.0
+        bucket["elapsed_ms_avg"] = round(sum(bucket["elapsed_ms"]) / len(bucket["elapsed_ms"])) if bucket["elapsed_ms"] else 0
+        bucket.pop("ttft_ms", None)
+        bucket.pop("tokens_per_sec", None)
+        bucket.pop("elapsed_ms", None)
     return sorted(buckets.values(), key=lambda b: (-b["total_tokens"], -b["requests"]))
 
 

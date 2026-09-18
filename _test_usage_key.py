@@ -50,6 +50,11 @@ check("reasoning tokens retained", by_id["k1"]["reasoning_tokens"] == 2, by_id["
 check("cached tokens retained", by_id["k1"]["cached_tokens"] == 3, by_id["k1"])
 check("success rate exposed", by_id["k1"]["success_rate_pct"] == 50.0, by_id["k1"])
 check("cache hit rate exposed", by_id["k1"]["cache_hit_pct"] == 30.0, by_id["k1"])
+check("prompt tokens exposed", by_id["k1"]["prompt_tokens"] == 10, by_id["k1"])
+check("completion tokens exposed", by_id["k1"]["completion_tokens"] == 5, by_id["k1"])
+check("TTFT p50 exposed", by_id["k1"]["ttft_ms_p50"] == 100, by_id["k1"])
+check("average speed exposed", by_id["k1"]["tokens_per_sec_avg"] == 50.0, by_id["k1"])
+check("wall time average exposed", by_id["k1"]["elapsed_ms_avg"] == 500, by_id["k1"])
 
 print()
 print("PASS=%d FAIL=%d" % (PASS, FAIL))
