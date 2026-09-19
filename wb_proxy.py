@@ -1841,6 +1841,19 @@ def clean_chunk(raw):
         if isinstance(delta.get("tool_calls"), list) and not delta["tool_calls"]:
             delta.pop("tool_calls")
             changed = True
+        elif isinstance(delta.get("tool_calls"), list):
+            # OpenAI sends the function name only in the opening tool-call
+            # delta. WorkBuddy repeats name="" on every argument fragment;
+            # strict clients treat that as a rename and overwrite the real name.
+            for tool_call in delta["tool_calls"]:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function")
+                if isinstance(function, dict) and "name" in function and not function.get("name"):
+                    function.pop("name", None)
+                    changed = True
+                    if not function:
+                        tool_call.pop("function", None)
         for key in NOISE_KEYS:
             if key in delta and not delta.get(key):
                 delta.pop(key)

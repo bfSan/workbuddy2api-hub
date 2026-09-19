@@ -187,5 +187,43 @@ check("valid tool: finish_reason is tool_calls", res_c["choices"][0]["finish_rea
 check("valid tool: tool_calls present", len(res_c["choices"][0]["message"].get("tool_calls", [])) == 1)
 
 print()
+print("[10] clean_chunk: repeated empty tool names are removed")
+opening = json.dumps({"choices": [{"delta": {"tool_calls": [{
+    "index": 0, "id": "call_ok",
+    "function": {"name": "bash", "arguments": ""},
+}]}}]})
+fragment = json.dumps({"choices": [{"delta": {"tool_calls": [{
+    "index": 0,
+    "function": {"name": "", "arguments": '{"command":"pwd"}'},
+}]}}]})
+opening_out = json.loads(P.clean_chunk(opening))
+fragment_out = json.loads(P.clean_chunk(fragment))
+check("opening tool name is preserved",
+      opening_out["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "bash")
+check("empty name is removed from argument fragment",
+      "name" not in fragment_out["choices"][0]["delta"]["tool_calls"][0]["function"])
+check("argument fragment is preserved",
+      fragment_out["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+      == '{"command":"pwd"}')
+
+parallel = json.dumps({"choices": [{"delta": {"tool_calls": [
+    {"index": 0, "function": {"name": "", "arguments": '{"command":"pwd"}'}},
+    {"index": 1, "function": {"name": "", "arguments": "{}"}},
+]}}]})
+parallel_out = json.loads(P.clean_chunk(parallel))
+parallel_calls = parallel_out["choices"][0]["delta"]["tool_calls"]
+check("parallel calls keep their indexes", [tc["index"] for tc in parallel_calls] == [0, 1])
+check("parallel empty names are removed",
+      all("name" not in tc["function"] for tc in parallel_calls))
+check("parallel arguments are preserved",
+      [tc["function"]["arguments"] for tc in parallel_calls] == ['{"command":"pwd"}', "{}"])
+
+standard = json.dumps({"choices": [{"delta": {"tool_calls": [{
+    "index": 0,
+    "function": {"arguments": '{"city":"Beijing"}'},
+}]}}]})
+check("standard OpenAI argument-only delta is unchanged", P.clean_chunk(standard) == standard)
+
+print()
 print("SUMMARY: PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
