@@ -3,7 +3,7 @@
 包含功能：
 1. 成长任务查询、批量接取 (accept)、构造事件上报点亮 (report)、领奖入账 (claim)。
 2. 连续打卡 (streak) 与能量 (energy) 余额查询。
-3. 猫猫旅行 (buddy travel) 状态查询与归来领奖。
+3. 猫猫旅行 (buddy travel) 状态查询、自动派出与归来领奖。
 4. 严格遵守 >= 1.0s 防风控间隔，并使用 wb_fingerprint 的稳定设备指纹。
 """
 import json
@@ -243,13 +243,7 @@ def report_events(account, events, base=BILL_BASE):
 
 
 def do_cat_travel(account):
-    """检查猫猫旅行状态，并领取已经到达的奖励。
-
-    The current desktop client no longer calls travel/depart. Its travel flow
-    is driven by the server-side activity; the client only claims an arrived
-    reward from the message center. Calling the retired depart endpoint only
-    produces a permanent 400 ("invalid request"), so idle is a no-op here.
-    """
+    """检查猫猫旅行状态，空闲时派出，归来后领取奖励。"""
     headers = account.headers("chat")
     # 1. 查询状态
     try:
@@ -263,7 +257,12 @@ def do_cat_travel(account):
     state = st.get("state")
     if state == "arrived":
         # 领奖
-        req_cl = urllib.request.Request(CHAT_BASE + "/activity/growth/buddy/travel/claim", data=b"", method="POST", headers=headers)
+        req_cl = urllib.request.Request(
+            CHAT_BASE + "/activity/growth/buddy/travel/claim",
+            data=b"{}",
+            method="POST",
+            headers=headers,
+        )
         try:
             with urllib.request.urlopen(req_cl, timeout=10) as resp:
                 c_res = json.loads(resp.read().decode("utf-8"))
@@ -284,9 +283,66 @@ def do_cat_travel(account):
     if state == "idle":
         if st.get("daily_limit_reached"):
             return {"ok": True, "action": "idle", "msg": "猫猫今日次数已用尽，次日 00:00 刷新"}
-        # 当前官方客户端由服务端活动触发旅行，客户端只负责在到达后领奖。
-        # travel/depart 已从客户端下线，调用它只会返回 400 invalid request。
-        return {"ok": True, "action": "idle", "msg": "猫猫当前在家，暂无待领取的旅行奖励"}
+
+        # 官方成长中心先从 config 取地点，再用 location_id 调用 depart。
+        # 旧实现发送空请求体，因此服务端始终返回 400 invalid request。
+        try:
+            req_cfg = urllib.request.Request(
+                CHAT_BASE + "/activity/growth/buddy/travel/config",
+                headers=headers,
+            )
+            with urllib.request.urlopen(req_cfg, timeout=10) as resp:
+                cfg_res = json.loads(resp.read().decode("utf-8"))
+            cfg = cfg_res.get("data") or {}
+            locations = cfg.get("locations") or []
+        except Exception as exc:
+            return {"ok": False, "msg": f"查询旅行地点失败: {exc}"}
+
+        if not locations:
+            return {"ok": False, "msg": "暂无可用旅行地点"}
+        location = locations[0] or {}
+        location_id = location.get("id")
+        if location_id is None:
+            return {"ok": False, "msg": "旅行地点缺少 id，无法派出"}
+
+        body = json.dumps({"location_id": location_id}).encode("utf-8")
+        req_dep = urllib.request.Request(
+            CHAT_BASE + "/activity/growth/buddy/travel/depart",
+            data=body,
+            method="POST",
+            headers=headers,
+        )
+        try:
+            with urllib.request.urlopen(req_dep, timeout=10) as resp:
+                dep_res = json.loads(resp.read().decode("utf-8"))
+            if dep_res.get("code") != 0:
+                msg = dep_res.get("msg") or dep_res.get("message") or "上游拒绝派出"
+                return {"ok": False, "action": "idle", "msg": f"派出旅行失败: {msg}"}
+            dep = dep_res.get("data") or {}
+            dep_location = dep.get("location") or location
+            location_name = dep_location.get("name") or "未知地点"
+            duration_min = dep_location.get("duration_hours_min")
+            duration_max = dep_location.get("duration_hours_max")
+            if duration_min is not None and duration_max is not None:
+                eta = f"，预计 {duration_min}～{duration_max} 小时归来"
+            else:
+                eta = ""
+            return {
+                "ok": True,
+                "action": "depart",
+                "location": location_name,
+                "msg": f"猫猫已成功派出旅行（{location_name}）{eta}！",
+            }
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = json.loads(exc.read().decode("utf-8", "replace"))
+                msg = detail.get("msg") or detail.get("message") or str(exc)
+            except Exception:
+                msg = str(exc)
+            _log(f"buddy/travel/depart rejected: HTTP {exc.code} msg={msg}")
+            return {"ok": False, "action": "idle", "msg": f"派出旅行失败: HTTP {exc.code} {msg}"}
+        except Exception as exc:
+            return {"ok": False, "action": "idle", "msg": f"派出旅行失败: {exc}"}
 
     if state == "traveling":
         return {"ok": True, "action": "traveling", "msg": "猫猫正在旅行途中，请稍后再来查看！"}
