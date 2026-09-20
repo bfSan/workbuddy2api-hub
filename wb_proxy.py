@@ -3643,6 +3643,15 @@ class Handler(BaseHTTPRequestHandler):
                 _models_cache["intl"] = {"at": 0.0, "data": None}
                 _models_cache["cn"] = {"at": 0.0, "data": None}
             reply["model_config_saved"] = saved
+        if "account_aliases" in payload:
+            aliases = payload.get("account_aliases")
+            if not isinstance(aliases, dict):
+                return self._error(400, "account_aliases must be an object",
+                                   "invalid_request_error")
+            saved = wb_settings.set_account_aliases(ACCOUNTS_DIR, aliases)
+            _WB_PATCH_ALIAS_CACHE["stamp"] = 0
+            _WB_PATCH_ALIAS_CACHE["data"] = {}
+            reply["account_aliases_saved"] = saved
         if payload.get("restart_scheduler"):
             if SCHEDULER:
                 SCHEDULER.stop()
