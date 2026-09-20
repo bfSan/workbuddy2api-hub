@@ -82,5 +82,51 @@ check("settings option keeps nickname fallback",
       options["u2"].get("nickname") == "upstream-two", options["u2"])
 
 print()
+print("[5] settings/save persists account aliases")
+class DummyHandler:
+    def __init__(self, payload):
+        self.payload = payload
+        self.reply = None
+        self.error = None
+
+    def _payload_or_error(self):
+        return self.payload
+
+    def _json(self, status, data):
+        self.reply = (status, data)
+        return data
+
+    def _error(self, status, message, error_type=None):
+        self.error = (status, message, error_type)
+        return {"error": message}
+
+
+def save_aliases(payload):
+    handler = DummyHandler({"account_aliases": payload})
+    P.Handler._handle_settings_save(handler)
+    return handler
+
+
+saved = save_aliases({"u1": "研发主号-新", "u2": "  "})
+check("save returns success", saved.error is None and saved.reply[0] == 200, saved.error)
+check("save returns persisted aliases",
+      saved.reply[1].get("account_aliases_saved") == {"u1": "研发主号-新"},
+      saved.reply)
+check("save writes aliases to settings",
+      wb_settings.account_aliases(tmp) == {"u1": "研发主号-新"},
+      wb_settings.account_aliases(tmp))
+check("save invalidates alias cache", P.wb_patch_account_aliases() == {"u1": "研发主号-新"},
+      P.wb_patch_account_aliases())
+
+cleared = save_aliases({})
+check("empty mapping clears aliases", cleared.error is None
+      and wb_settings.account_aliases(tmp) == {}, cleared.error)
+check("cache reflects cleared aliases", P.wb_patch_account_aliases() == {},
+      P.wb_patch_account_aliases())
+
+invalid = save_aliases(["not-an-object"])
+check("invalid mapping is rejected", invalid.error and invalid.error[0] == 400, invalid.error)
+
+print()
 print("PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
