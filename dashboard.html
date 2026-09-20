@@ -332,7 +332,7 @@ a:hover{text-decoration:underline}
         </select>
         <select id="taskAccountSel" onchange="onTaskAccountChange(this.value)" title="选择要执行任务的账号" style="padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:var(--panel);color:var(--text)"></select>
         <button class="primary" id="btnRunTasks" onclick="runGrowthTasks(this)">一键做任务领积分</button>
-        <button id="btnCatTravel" onclick="triggerCatTravel(this)">猫猫旅行</button>
+        <button id="btnCatTravel" onclick="triggerCatTravel(this)">检查并领取旅行奖励</button>
       </div>
     </div>
 
@@ -1297,7 +1297,7 @@ async function runGrowthTasks(btn){
 }
 
 async function triggerCatTravel(btn){
-  if(btn){ btn.disabled = true; btn.textContent = '旅行中...'; }
+  if(btn){ btn.disabled = true; btn.textContent = '检查中...'; }
   try{
     const payload = {};
     if(CURRENT_GROWTH_UID && CURRENT_GROWTH_UID !== 'all'){
@@ -1310,7 +1310,7 @@ async function triggerCatTravel(btn){
   }catch(e){
     toast("猫猫旅行失败: " + e.message, "bad");
   }finally{
-    if(btn){ btn.disabled = false; btn.textContent = '猫猫旅行'; }
+    if(btn){ btn.disabled = false; btn.textContent = '检查并领取旅行奖励'; }
   }
 }
 
