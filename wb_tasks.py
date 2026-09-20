@@ -3,7 +3,7 @@
 包含功能：
 1. 成长任务查询、批量接取 (accept)、构造事件上报点亮 (report)、领奖入账 (claim)。
 2. 连续打卡 (streak) 与能量 (energy) 余额查询。
-3. 猫猫旅行 (buddy travel) 状态查询、自动派出与自动领奖。
+3. 猫猫旅行 (buddy travel) 状态查询与归来领奖。
 4. 严格遵守 >= 1.0s 防风控间隔，并使用 wb_fingerprint 的稳定设备指纹。
 """
 import json
@@ -243,7 +243,13 @@ def report_events(account, events, base=BILL_BASE):
 
 
 def do_cat_travel(account):
-    """检查并执行猫猫旅行 (领奖 / 派出)。"""
+    """检查猫猫旅行状态，并领取已经到达的奖励。
+
+    The current desktop client no longer calls travel/depart. Its travel flow
+    is driven by the server-side activity; the client only claims an arrived
+    reward from the message center. Calling the retired depart endpoint only
+    produces a permanent 400 ("invalid request"), so idle is a no-op here.
+    """
     headers = account.headers("chat")
     # 1. 查询状态
     try:
@@ -264,21 +270,23 @@ def do_cat_travel(account):
                 credit = (c_res.get("data") or {}).get("reward_credit", 0)
                 account.fetch_credits()
                 return {"ok": True, "action": "claim", "credit": credit, "msg": f"旅行归来领奖成功！获得 {credit} 积分"}
+        except urllib.error.HTTPError as e:
+            try:
+                detail = json.loads(e.read().decode("utf-8", "replace"))
+                msg = detail.get("msg") or detail.get("message") or str(e)
+            except Exception:
+                msg = str(e)
+            _log(f"buddy/travel/claim rejected: HTTP {e.code} msg={msg}")
+            return {"ok": False, "msg": f"领奖失败: HTTP {e.code} {msg}"}
         except Exception as e:
             return {"ok": False, "msg": f"领奖失败: {e}"}
 
     if state == "idle":
         if st.get("daily_limit_reached"):
-            return {"ok": True, "action": "idle", "msg": "猫猫今日已完成旅行，明日 00:00 刷新"}
-        # 派出旅行
-        req_dep = urllib.request.Request(CHAT_BASE + "/activity/growth/buddy/travel/depart", data=b"", method="POST", headers=headers)
-        try:
-            with urllib.request.urlopen(req_dep, timeout=10) as resp:
-                dep_res = json.loads(resp.read().decode("utf-8"))
-                if dep_res.get("code") == 0:
-                    return {"ok": True, "action": "depart", "msg": "猫猫已成功派出旅行，预计数小时后归来！"}
-        except Exception as e:
-            return {"ok": False, "msg": f"派出旅行失败: {e}"}
+            return {"ok": True, "action": "idle", "msg": "猫猫今日次数已用尽，次日 00:00 刷新"}
+        # 当前官方客户端由服务端活动触发旅行，客户端只负责在到达后领奖。
+        # travel/depart 已从客户端下线，调用它只会返回 400 invalid request。
+        return {"ok": True, "action": "idle", "msg": "猫猫当前在家，暂无待领取的旅行奖励"}
 
     if state == "traveling":
         return {"ok": True, "action": "traveling", "msg": "猫猫正在旅行途中，请稍后再来查看！"}
