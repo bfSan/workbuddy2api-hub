@@ -3,7 +3,7 @@
 负责常驻后台自动执行：
 1. Token 保活 (Keepalive)：定期检查 Token 剩余寿命，不足 2 小时自动调用 Refresh Token。
 2. 每日签到 (Daily Checkin)：每日定时为所有国内版账号自动签到领积分。
-3. 猫猫旅行与日常结算 (Cat Travel & Welfare)：自动检查并领取归来的旅行奖励。
+3. 猫猫旅行与日常结算 (Cat Travel & Welfare)：自动派出并领取归来的旅行奖励。
 4. 状态持久化与看板展示：暴露状态、执行记录、支持手动立即触发与开关切换。
 """
 import threading
@@ -17,7 +17,7 @@ class Scheduler:
         self.pool = pool
         # 对齐 Sliverkiss/workbuddy2api 官方默认排程 (CST 24小时制)
         self.checkin_hours = [9, 21]     # 每日 09:00、21:00 签到
-        self.travel_hours = [9, 21]      # 每日两次检查归来奖励
+        self.travel_hours = [9, 21]      # 每日两次派出并检查归来奖励
         self.keepalive_hours = [22]      # 每日 22:00 集中 Token 保活检查
         self.cat_hours = [1]             # 每日 01:00 夜猫子专属任务
         self.all_hours = sorted(list(set(self.checkin_hours + self.travel_hours + self.keepalive_hours + self.cat_hours)))
@@ -154,9 +154,9 @@ class Scheduler:
                         self.log(f"! 账号 [{uid8}] 自动签到未成功: {res.get('error') or res.get('msg')}")
                     time.sleep(1.0)
 
-                # 检查猫猫旅行并领取已经到达的奖励
+                # 空闲时派出猫猫旅行；归来后领取奖励
                 tr = do_cat_travel(acc)
-                if tr.get("action") == "claim":
+                if tr.get("action") in ("depart", "claim"):
                     travel_count += 1
                     self.log(f"🐱 账号 [{uid8}] 猫猫日常处理: {tr.get('msg')}")
                 time.sleep(1.0)
@@ -166,8 +166,8 @@ class Scheduler:
     def status(self):
         return {
             "enabled": self.enabled,
-            "mode": "整点排程 (09:00/21:00 签到与旅行领奖 · 22:00 保活 · 01:00 夜猫)",
-            "mode_cn": "整点排程 (09:00/21:00 签到与旅行领奖 · 22:00 保活 · 01:00 夜猫)",
+            "mode": "整点排程 (09:00/21:00 签到与猫猫派出/领奖 · 22:00 保活 · 01:00 夜猫)",
+            "mode_cn": "整点排程 (09:00/21:00 签到与猫猫派出/领奖 · 22:00 保活 · 01:00 夜猫)",
             "mode_intl": "账号 Token 自动保活与凭证常驻 (每日 22:00 集中巡检)",
             "last_run_time": self.last_run_time or "尚未运行",
             "next_run_time": self.next_run_time or "待调度",
