@@ -181,5 +181,30 @@ finally:
     os.environ.pop("WB_MODEL_SET", None)
 
 print()
+print("[13] config view exposes full metadata for hidden models")
+original_product_reader = P.read_product_config_models
+original_endpoint_reader = P.fetch_endpoint_models
+try:
+    P.read_product_config_models = lambda realm=None: [
+        ("hy3", {"credits": "x0.42", "name": "HY3", "supportsToolCall": True}),
+        ("hidden-model", {"credits": "x1.23", "name": "Hidden"}),
+    ]
+    P.fetch_endpoint_models = lambda realm=None, force=False: []
+    wb_settings.set_model_config(TMP, "cn", ["hidden-model"], ["hy3", "hidden-model"])
+    config = P.models_config_view()
+    realm_config = config["realms"]["cn"]
+    pool_models = {item["id"]: item for item in realm_config["pool_models"]}
+    check("hidden model remains in pool ids", "hidden-model" in realm_config["pool"],
+          realm_config["pool"])
+    check("hidden model detail keeps credits",
+          pool_models.get("hidden-model", {}).get("credits") == "x1.23",
+          pool_models.get("hidden-model"))
+    check("hidden model is absent from visible list", "hidden-model" not in realm_config["visible"],
+          realm_config["visible"])
+finally:
+    P.read_product_config_models = original_product_reader
+    P.fetch_endpoint_models = original_endpoint_reader
+
+print()
 print("PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
