@@ -955,11 +955,13 @@ def models_config_view():
             entries = merge_catalog(product + (live or []), realm=realm)
         except Exception:
             entries = merge_catalog([], realm=realm)
-        full_ids = [mid for mid, _ in entries if mid]
+        full_models = [model_entry(mid, meta) for mid, meta in entries if mid]
+        full_ids = [item["id"] for item in full_models]
         env_visible = [mid for mid, _ in wb_patch_pick(entries, realm) if mid]
         entry = cfg.get(realm) or {}
         out[realm] = {
             "pool": full_ids,
+            "pool_models": full_models,
             "visible": env_visible,
             "hidden": entry.get("hidden") or [],
             "order": entry.get("order") or [],

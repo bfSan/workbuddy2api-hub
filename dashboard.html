@@ -804,8 +804,9 @@ async function loadModels(){
       const cfg = await getJSON('/settings/models');
       const rc = (cfg.realms || {})[window.VIEW_REALM] || {};
       MODEL_POOL = rc.pool || [];
+      MODEL_POOL_DATA = rc.pool_models || [];
       MODEL_CONFIG = { hidden: rc.hidden || [], order: rc.order || [] };
-    }catch(e){ MODEL_POOL = MODELS_DATA.map(m => m.id); }
+    }catch(e){ MODEL_POOL = MODELS_DATA.map(m => m.id); MODEL_POOL_DATA = MODELS_DATA.slice(); }
     renderAvailableModels();
   }catch(e){
     console.error('loadModels error:', e);
@@ -921,6 +922,13 @@ function renderAvailableModels(){
 window.MODEL_EDIT_MODE = false;
 window.MODEL_CONFIG = { hidden: [], order: [] };
 window.MODEL_POOL = [];   // 该 realm 的合并后全量池（含已隐藏项）
+window.MODEL_POOL_DATA = [];
+
+function getModelFromPool(id){
+  const fromPool = (MODEL_POOL_DATA || []).find(m => m && m.id === id);
+  if(fromPool) return fromPool;
+  return (MODELS_DATA || []).find(m => m && m.id === id) || null;
+}
 
 function toggleModelEdit(){
   MODEL_EDIT_MODE = !MODEL_EDIT_MODE;
@@ -952,8 +960,16 @@ function hideModel(id){
 }
 
 function unhideModel(id){
+  const wasHidden = (MODEL_CONFIG.hidden || []).includes(id);
   MODEL_CONFIG.hidden = (MODEL_CONFIG.hidden || []).filter(x => x !== id);
-  loadModels();
+  if(wasHidden && !MODELS_DATA.some(m => m.id === id)){
+    // The public list omits hidden models, so restore from the server-side
+    // full pool captured by loadModels() rather than re-fetching the same
+    // filtered /v1/models response.
+    const restored = getModelFromPool(id);
+    if(restored) MODELS_DATA.push(restored);
+  }
+  renderAvailableModels();
 }
 
 function moveModel(id, dir){
