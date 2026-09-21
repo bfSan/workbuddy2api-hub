@@ -36,11 +36,10 @@ if (start < 0 || end < 0 || end < start) {
 
 const region = html.slice(start + BEGIN.length, end);
 const core = new Function(
-  'paginate',
-  '"use strict";' + region + '; return {paginate, pageWindow, filterByQuery, clampSize};',
+  '"use strict";' + region + '; return {paginate, pageWindow, filterByQuery, clampSize, sortRows};',
 )();
 
-const { paginate, pageWindow, filterByQuery, clampSize } = core;
+const { paginate, pageWindow, filterByQuery, clampSize, sortRows } = core;
 const list = (n) => Array.from({ length: n }, (_, i) => i + 1);
 
 console.log('clampSize');
@@ -188,6 +187,81 @@ console.log('filterByQuery');
   check('filtered search drives the page count', v.total === 5 && v.pages === 1, v);
 }
 
+console.log('sortRows: numbers');
+{
+  const rows = [{ n: 3, id: 'c' }, { n: 1, id: 'a' }, { n: 2, id: 'b' }];
+  const key = (r) => r.n;
+  check('ascending numeric order',
+        sortRows(rows, key, 'asc').map((r) => r.id).join('') === 'abc',
+        sortRows(rows, key, 'asc').map((r) => r.id));
+  check('descending numeric order',
+        sortRows(rows, key, 'desc').map((r) => r.id).join('') === 'cba',
+        sortRows(rows, key, 'desc').map((r) => r.id));
+}
+
+console.log('sortRows: strings');
+{
+  const rows = [{ s: 'beta' }, { s: 'Alpha' }, { s: 'gamma' }];
+  const key = (r) => r.s.toLowerCase();
+  check('ascending text order',
+        sortRows(rows, key, 'asc').map((r) => r.s).join(',') === 'Alpha,beta,gamma');
+  check('descending text order',
+        sortRows(rows, key, 'desc').map((r) => r.s).join(',') === 'gamma,beta,Alpha');
+}
+
+console.log('sortRows: mixed and missing values');
+{
+  // Credits are absent until the panel queries them, so a missing row must not
+  // sort above a real zero.
+  const rows = [{ c: 5 }, { c: undefined }, { c: 0 }, { c: -1 }];
+  const key = (r) => (typeof r.c === 'number' ? r.c : -2);
+  check('missing values sink to the bottom ascending',
+        sortRows(rows, key, 'asc')[0].c === undefined, sortRows(rows, key, 'asc'));
+  check('missing values sink to the bottom descending',
+        sortRows(rows, key, 'desc')[3].c === undefined);
+}
+{
+  const rows = [{ v: 2 }, { v: 'x' }, { v: 1 }];
+  const key = (r) => r.v;
+  const asc = sortRows(rows, key, 'asc');
+  check('a numeric column with a stray string does not throw', asc.length === 3, asc.length);
+}
+
+console.log('sortRows: stability and purity');
+{
+  const rows = [
+    { tier: 1, id: 'first' }, { tier: 1, id: 'second' },
+    { tier: 0, id: 'third' }, { tier: 1, id: 'fourth' },
+  ];
+  const asc = sortRows(rows, (r) => r.tier, 'asc');
+  check('ties keep their original relative order',
+        asc.map((r) => r.id).join(',') === 'third,first,second,fourth',
+        asc.map((r) => r.id));
+  const desc = sortRows(rows, (r) => r.tier, 'desc');
+  check('descending ties still keep original order',
+        desc.map((r) => r.id).join(',') === 'first,second,fourth,third',
+        desc.map((r) => r.id));
+}
+{
+  const rows = list(5);
+  const copy = rows.slice();
+  sortRows(rows, (n) => -n, 'asc');
+  check('sortRows does not mutate the input', JSON.stringify(rows) === JSON.stringify(copy));
+  check('null list is safe', sortRows(null, (x) => x, 'asc').length === 0);
+}
+
+console.log('sortRows composes with pagination');
+{
+  // Sorting must happen before slicing, or page 2 would show a different
+  // ordering than page 1 and the row indices would disagree with the header.
+  const rows = Array.from({ length: 25 }, (_, i) => ({ n: 25 - i, id: 'r' + i }));
+  const sorted = sortRows(rows, (r) => r.n, 'asc');
+  const v = paginate(sorted, { page: 2 }, 10);
+  check('page 2 of a sorted list holds ranks 11-20',
+        v.items[0].item.n === 11 && v.items[9].item.n === 20,
+        [v.items[0].item.n, v.items[9].item.n]);
+  check('sorted page indices are absolute', v.items[0].index === 10, v.items[0].index);
+}
 console.log('');
 console.log('pagination: ' + PASS + ' passed, ' + FAIL + ' failed');
 process.exit(FAIL ? 1 : 0);
