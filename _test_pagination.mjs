@@ -44,9 +44,12 @@ const { paginate, pageWindow, filterByQuery, clampSize } = core;
 const list = (n) => Array.from({ length: n }, (_, i) => i + 1);
 
 console.log('clampSize');
-check('falls back to 20 for unknown sizes', clampSize(7) === 20, clampSize(7));
-check('accepts the offered sizes', [20, 50, 100].every((s) => clampSize(s) === s));
-check('tolerates junk input', clampSize(undefined) === 20 && clampSize('nope') === 20);
+check('falls back to the smallest size for unknown values', clampSize(7) === 10, clampSize(7));
+check('accepts the offered sizes', [10, 20, 50].every((s) => clampSize(s) === s));
+check('tolerates junk input', clampSize(undefined) === 10 && clampSize('nope') === 10);
+// An earlier build offered 100/page and persisted that choice in the browser,
+// so a retired size has to degrade to the default rather than to zero rows.
+check('a retired saved size falls back to the default', clampSize(100) === 10, clampSize(100));
 
 console.log('paginate: empty and small lists');
 {
@@ -121,7 +124,8 @@ console.log('paginate: page size changes');
 }
 {
   const v = paginate(list(100), { page: 1 }, 100);
-  check('100 rows at 100 per page make 1 page', v.pages === 1 && v.items.length === 100);
+  check('a retired 100 per page clamps to 10 rows', v.size === 10 && v.items.length === 10, v.size);
+  check('a retired 100 per page keeps the page count honest', v.pages === 10, v.pages);
 }
 
 console.log('pageWindow');

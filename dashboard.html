@@ -1504,7 +1504,7 @@ function toast(msg, kind){
 /* ---------------------------------------------------------------------- */
 
 /* pagination-core:begin */
-var PAGE_SIZES = [20, 50, 100];
+var PAGE_SIZES = [10, 20, 50];
 
 function clampSize(n){
   n = Number(n);
@@ -1562,7 +1562,7 @@ function filterByQuery(list, q, hayFn){
 
 var PAGE_STORE = 'wb-proxy-page';
 var PAGE_STATE = { accounts: { page: 1, q: '' }, keys: { page: 1 } };
-var PAGE_SIZE = { accounts: 20, keys: 20 };
+var PAGE_SIZE = { accounts: 10, keys: 10 };
 
 try {
   var savedPage = JSON.parse(localStorage.getItem(PAGE_STORE) || 'null');

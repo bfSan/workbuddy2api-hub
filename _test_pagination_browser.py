@@ -141,29 +141,29 @@ def run_checks(base):
         check("no page errors during boot", not errors, errors[:2])
 
         print("account table")
-        check("page 1 shows one page of 20", rows(page) == 20, rows(page))
-        check("count line reads 1-20 of 63", info(page) == "第 1-20 条 / 共 63 条", info(page))
+        check("page 1 shows one page of 10", rows(page) == 10, rows(page))
+        check("count line reads 1-10 of 63", info(page) == "第 1-10 条 / 共 63 条", info(page))
         check("header reports the full pool across both realms",
               "全量 88" in page.locator("#acctCount").inner_text(),
               page.locator("#acctCount").inner_text())
 
         page.locator("#accounts .pager-nav").get_by_text("3", exact=True).first.click()
-        check("jump to page 3 shows 20 rows", rows(page) == 20, rows(page))
-        check("page 3 count line reads 41-60", info(page) == "第 41-60 条 / 共 63 条", info(page))
-        check("page 3 starts at the 41st account",
-              "国际号040" in page.locator("#accounts tbody tr").first.inner_text(),
+        check("jump to page 3 shows 10 rows", rows(page) == 10, rows(page))
+        check("page 3 count line reads 21-30", info(page) == "第 21-30 条 / 共 63 条", info(page))
+        check("page 3 starts at the 21st account",
+              "国际号020" in page.locator("#accounts tbody tr").first.inner_text(),
               page.locator("#accounts tbody tr").first.inner_text()[:40])
 
         # loadAccounts() re-enters renderAccounts() every 15s; the page must hold.
         page.wait_for_timeout(17000)
         check("15s poll did not bounce the viewer off page 3",
-              info(page) == "第 41-60 条 / 共 63 条", info(page))
+              info(page) == "第 21-30 条 / 共 63 条", info(page))
         check("polled page 3 still shows the same rows",
-              "国际号040" in page.locator("#accounts tbody tr").first.inner_text())
+              "国际号020" in page.locator("#accounts tbody tr").first.inner_text())
 
         print("account search")
         page.fill("#acctSearch", "国际号05")
-        check("search resets to page 1", info(page).startswith("第 1-10"), info(page))
+        check("search resets to page 1", info(page) == "第 1-10 条 / 共 10 条", info(page))
         check("search narrows to 10 rows", rows(page) == 10, rows(page))
         check("header reflects the filter",
               "筛选 10 / 63" in page.locator("#acctCount").inner_text(),
@@ -174,50 +174,62 @@ def run_checks(base):
         check("no match shows an empty state",
               "没有匹配" in page.locator("#accounts").inner_text())
         page.fill("#acctSearch", "")
-        check("clearing search restores page 1", rows(page) == 20 and info(page) == "第 1-20 条 / 共 63 条",
-              info(page))
+        check("clearing search restores page 1",
+              rows(page) == 10 and info(page) == "第 1-10 条 / 共 63 条", info(page))
 
         print("account page size")
-        page.select_option("#accounts .pager-size", "100")
-        check("100/page shows every account", rows(page) == 63, rows(page))
-        # 63 rows at 100/page is a single page; the selector must survive that.
-        check("page-size control stays available on a single page",
-              page.locator("#accounts .pager-size").count() == 1,
-              page.locator("#accounts .pager-size").count())
+        page.select_option("#accounts .pager-size", "50")
+        check("50/page shows 50 accounts", rows(page) == 50, rows(page))
+        check("63 accounts at 50/page still needs two pages",
+              page.locator("#accounts .pager-nav").count() == 1)
+        page.select_option("#accounts .pager-size", "10")
+        check("back to 10/page", rows(page) == 10, rows(page))
+        # A retired 100/page persisted by an earlier build must not stick.
+        check("100 is no longer offered",
+              page.locator("#accounts .pager-size option").count() == 3,
+              page.locator("#accounts .pager-size option").count())
+
+        # A result set that fits one page drops the buttons but keeps the size
+        # selector, otherwise the viewer is stranded at that size.
+        page.select_option("#accounts .pager-size", "50")
+        page.fill("#acctSearch", "国际号05")
         check("single page hides the page buttons",
               page.locator("#accounts .pager-nav").count() == 0)
-        page.select_option("#accounts .pager-size", "20")
-        check("back to 20/page", rows(page) == 20, rows(page))
+        check("page-size control stays available on a single page",
+              page.locator("#accounts .pager-size").count() == 1)
+        page.fill("#acctSearch", "")
+        page.select_option("#accounts .pager-size", "10")
 
         print("api key editor")
         # PAGE_STATE is declared after switchViewRealm in the file, so this also
         # proves the realm toggle can reach it at click time rather than at parse.
         page.evaluate("() => { PAGE_STATE.accounts.page = 3; renderAccounts(); }")
         check("page 3 is set before the realm switch",
-              info(page) == "第 41-60 条 / 共 63 条", info(page))
+              info(page) == "第 21-30 条 / 共 63 条", info(page))
         page.evaluate("() => switchViewRealm('cn')")
         page.wait_for_timeout(500)
         check("switching realm returns to page 1",
               page.evaluate("() => PAGE_STATE.accounts.page") == 1,
               page.evaluate("() => PAGE_STATE.accounts.page"))
         check("cn view shows the cn pool from page 1",
-              info(page) == "第 1-20 条 / 共 25 条", info(page))
+              info(page) == "第 1-10 条 / 共 25 条", info(page))
         page.evaluate("() => switchViewRealm('intl')")
         page.wait_for_timeout(500)
         check("switching back starts clean",
-              info(page) == "第 1-20 条 / 共 63 条", info(page))
+              info(page) == "第 1-10 条 / 共 63 条", info(page))
 
         page.click("#btnNavSettings")
         page.wait_for_selector("#keyList > div")
-        check("key page 1 shows 20 rows", cards(page) == 20, cards(page))
+        check("key page 1 shows 10 rows", cards(page) == 10, cards(page))
         check("key pager reports 45 keys",
-              "第 1-20 条 / 共 45 条" in page.locator("#keyList .pager-info").inner_text(),
+              "第 1-10 条 / 共 45 条" in page.locator("#keyList .pager-info").inner_text(),
               page.locator("#keyList .pager-info").inner_text())
 
-        page.locator("#keyList .pager-nav").get_by_text("3", exact=True).first.click()
-        check("key page 3 shows the 5-row remainder", cards(page) == 5, cards(page))
+        # 45 keys at 10/page is five pages; the last one holds the remainder.
+        page.locator("#keyList .pager-nav").get_by_text("末页", exact=True).first.click()
+        check("key last page shows the 5-row remainder", cards(page) == 5, cards(page))
         first_key = page.locator("#keyList input[placeholder='备注名']").first
-        check("key page 3 starts at key-40", first_key.input_value() == "key-40",
+        check("key last page starts at key-40", first_key.input_value() == "key-40",
               first_key.input_value())
 
         # The last card is absolute row 44. Its dropdown must mutate row 44, not row 4.
@@ -235,7 +247,7 @@ def run_checks(base):
         # The pager is still clickable with that panel open.
         page.locator("#keyList .pager-nav").get_by_text("首页", exact=True).first.click()
         check("paging back to page 1",
-              "第 1-20 条 / 共 45 条" in page.locator("#keyList .pager-info").inner_text(),
+              "第 1-10 条 / 共 45 条" in page.locator("#keyList .pager-info").inner_text(),
               page.locator("#keyList .pager-info").inner_text())
         check("paging closed the account dropdown",
               page.evaluate("() => KEY_ACCT_UI.open") == -1,
