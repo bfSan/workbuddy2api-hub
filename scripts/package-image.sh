@@ -62,6 +62,15 @@ if [[ "${SKIP_TESTS:-0}" != "1" ]]; then
     "$VENV_DIR/bin/python" _test_usage_key.py
     "$VENV_DIR/bin/python" _test_account_display.py
     "$VENV_DIR/bin/python" _test_cat_travel.py
+    # The dashboard pagination core is plain JS, so gate it whenever node is
+    # around without making node a hard build dependency. The companion
+    # _test_pagination_browser.py needs a downloaded browser and is not run
+    # here; run it by hand before touching the panel's list rendering.
+    if command -v node >/dev/null 2>&1; then
+      node _test_pagination.mjs
+    else
+      printf 'package-image: node not found, skipping _test_pagination.mjs\n' >&2
+    fi
   )
 else
   printf '\n[1/4] regression tests skipped (SKIP_TESTS=1)\n'
