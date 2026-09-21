@@ -29,8 +29,18 @@ def check(label, cond, extra=""):
         print("  [FAIL] " + label + ("  " + str(extra) if extra else ""))
 
 
+# requests[i] is a scramble, not the row number, so "first row after sorting by
+# 请求" disagrees with the server order and the assertion can actually fail.
+def scrambled(i):
+    return ((i * 5 + 11) % 63) + 1
+
+
 ACCOUNTS = [{"uid": "intl%03d" % i, "nickname": "国际号%03d" % i, "realm": "intl",
-             "enabled": True, "source": "oauth", "expiresIn": "30d"} for i in range(63)]
+             "enabled": True, "source": "oauth", "expiresIn": "30d",
+             "credits": {"remain": 100 - i, "size": 500}} for i in range(63)]
+USAGE = [{"account": "intl%03d" % i, "requests": scrambled(i),
+          "total_tokens": scrambled(i) * 10, "cached_tokens": scrambled(i)}
+         for i in range(63)]
 # The server hands back both realms and the panel filters client side, so the
 # realm toggle exercises the real path.
 CN_ACCOUNTS = [{"uid": "cn%03d" % i, "nickname": "国内号%03d" % i, "realm": "cn",
@@ -53,7 +63,7 @@ def api_payload(path):
     if path.startswith("/accounts"):
         return {"accounts": ALL_ACCOUNTS}
     if path.startswith("/usage/by-account"):
-        return {"accounts": []}
+        return {"accounts": USAGE}
     if path.startswith("/usage/by-key"):
         return {"keys": []}
     if path.startswith("/usage/recent"):
@@ -124,6 +134,33 @@ def info(page):
 def cards(page):
     # The pager is also a direct child div, so count only the key cards.
     return page.locator("#keyList > div:not(.pager)").count()
+
+
+GEO_JS = """() => {
+  const rows = [...document.querySelectorAll('#keyList > .keyrow')];
+  return rows.map(r => {
+    const kids = [...r.children].filter(el => getComputedStyle(el).display !== 'none');
+    const rects = kids.map(el => el.getBoundingClientRect());
+    const cy = rects.map(x => x.top + x.height / 2);
+    return { count: kids.length, height: r.getBoundingClientRect().height,
+             cyMin: Math.min(...cy), cyMax: Math.max(...cy),
+             lefts: rects.map(x => x.left).sort((p, q) => p - q),
+             rights: rects.map(x => x.right).sort((p, q) => p - q) };
+  });
+}"""
+
+
+def overlaps(g):
+    """First free slot at or after each control's left edge, in document order."""
+    lefts, rights = g["lefts"], g["rights"]
+    for k in range(len(lefts)):
+        prev = -1e18
+        for j in range(len(rights)):
+            if rights[j] > lefts[k] + 1 and rights[j] < prev:
+                prev = rights[j]
+        if prev > lefts[k] + 1:
+            return (round(lefts[k]), round(prev))
+    return None
 
 
 def run_checks(base):
@@ -200,6 +237,95 @@ def run_checks(base):
         page.fill("#acctSearch", "")
         page.select_option("#accounts .pager-size", "10")
 
+        print("account sorting")
+        # Fixtures put credits at 100-i, so the credit column is a clean ordering
+        # probe that never agrees with the server order past the first row.
+        def credit_col(n=3):
+            return page.eval_on_selector_all(
+                "#accounts tbody tr",
+                """(rs, n) => rs.slice(0, n).map(r =>
+                    r.querySelectorAll('td')[3].innerText.trim())""", n)
+
+        check("no sort starts in server order",
+              "国际号000" in page.locator("#accounts tbody tr").first.inner_text())
+        check("inactive headers show the neutral glyph",
+              page.locator("#accounts th.sortable.active").count() == 0)
+
+        page.click("#th-accounts-credit")
+        check("first click on a numeric column sorts descending",
+              page.evaluate("() => PAGE_STATE.accounts.sort.key") == "credit"
+              and page.evaluate("() => PAGE_STATE.accounts.sort.dir") == "desc",
+              page.evaluate("() => PAGE_STATE.accounts.sort"))
+        check("descending puts the fullest account first",
+              credit_col(1)[0].startswith("100"), credit_col(3))
+        check("sort marks the header active",
+              page.locator("#accounts th.sortable.active").count() == 1)
+        # The header markup and the stylesheet name the glyph separately, so a
+        # rename on one side would silently drop the styling.
+        check("the sort glyph is styled, not just present",
+              page.evaluate("""() => {
+                const el = document.querySelector('#th-accounts-credit .sort-glyph');
+                return !!el && getComputedStyle(el).marginLeft !== '0px';
+              }"""))
+
+        page.click("#th-accounts-credit")
+        check("second click flips to ascending",
+              page.evaluate("() => PAGE_STATE.accounts.sort.dir") == "asc")
+        # remain is 100-i, so the smallest balance on the list is 38.
+        check("ascending empties first",
+              credit_col(1)[0].startswith("38"), credit_col(3))
+
+        # Sorting replaces the list, so the viewer must land on page 1.
+        page.click("#th-accounts-credit")
+        check("third click clears the sort and returns to server order",
+              page.evaluate("() => PAGE_STATE.accounts.sort") == {"key": "", "dir": ""}
+              and "国际号000" in page.locator("#accounts tbody tr").first.inner_text(),
+              credit_col(2))
+
+        page.click("#th-accounts-name")
+        check("first click on a text column sorts ascending",
+              page.evaluate("() => PAGE_STATE.accounts.sort") == {"key": "name", "dir": "asc"})
+        page.click("#th-accounts-realm")
+        check("changing column restarts the cycle descending for numbers, ascending for text",
+              page.evaluate("() => PAGE_STATE.accounts.sort") == {"key": "realm", "dir": "asc"})
+        page.click("#th-accounts-name")
+
+        print("sorting composes with paging")
+        # A fresh column lands on descending; a third click would clear it.
+        page.click("#th-accounts-credit")
+        page.locator("#accounts .pager-nav").get_by_text("2", exact=True).first.click()
+        check("sorted page 2 holds ranks 11-20",
+              page.evaluate("() => PAGE_STATE.accounts.sort.dir") == "desc"
+              and info(page) == "第 11-20 条 / 共 63 条", info(page))
+        # Ranks 1-10 are remain 100..91, so rank 11 is 90.
+        check("descending page 2 starts at 90",
+              credit_col(1)[0].startswith("90"), credit_col(3))
+        # The 15s poll repaints the table; both the order and the page must hold.
+        page.wait_for_timeout(17000)
+        check("the poll kept the sort",
+              page.evaluate("() => PAGE_STATE.accounts.sort") == {"key": "credit", "dir": "desc"},
+              page.evaluate("() => PAGE_STATE.accounts.sort"))
+        check("the poll kept page 2 with the same order",
+              info(page) == "第 11-20 条 / 共 63 条" and credit_col(1)[0].startswith("90"),
+              [info(page), credit_col(2)])
+
+        print("sorting persists across reload")
+        page.reload(wait_until="networkidle")
+        page.wait_for_timeout(600)
+        check("reload restores the saved sort",
+              page.evaluate("() => PAGE_STATE.accounts.sort") == {"key": "credit", "dir": "desc"},
+              page.evaluate("() => PAGE_STATE.accounts.sort"))
+        check("restored sort is still descending",
+              credit_col(1)[0].startswith("100"), credit_col(3))
+        # The saved sort is descending, so it takes two more clicks to walk the
+        # cycle desc -> asc -> none and leave server order for the checks below.
+        page.click("#th-accounts-credit")
+        check("second click on a numeric column reaches ascending",
+              page.evaluate("() => PAGE_STATE.accounts.sort") == {"key": "credit", "dir": "asc"})
+        page.click("#th-accounts-credit")
+        check("sort cleared before the key checks",
+              page.evaluate("() => PAGE_STATE.accounts.sort") == {"key": "", "dir": ""})
+
         print("api key editor")
         # PAGE_STATE is declared after switchViewRealm in the file, so this also
         # proves the realm toggle can reach it at click time rather than at parse.
@@ -233,6 +359,11 @@ def run_checks(base):
               first_key.input_value())
 
         # The last card is absolute row 44. Its dropdown must mutate row 44, not row 4.
+        check("account dropdown no longer forces a full-width line",
+              page.evaluate("""() => { const el = document.querySelector('.kac-wrap');
+                const cs = getComputedStyle(el);
+                return cs.width !== el.parentElement.getBoundingClientRect().width
+                       + 'px' && cs.position === 'relative'; }"""))
         page.locator("#keyList .kac-wrap").last.locator("button").first.click()
         page.wait_for_selector("#kac-panel-44", state="visible")
         # It anchors upward so it cannot cover the pager beneath the last card.
@@ -278,6 +409,42 @@ def run_checks(base):
         check("last page renders the fresh row",
               page.locator("#keyList input[placeholder='备注名']").count() == 6,
               page.locator("#keyList input[placeholder='备注名']").count())
+
+        print("key row stays on one line")
+        # The account dropdown used to carry width:100%, which pushed the trailing
+        # controls onto a second line. Measure page 1, where every row is a saved
+        # key with a masked hint, so the control count is uniform.
+        page.locator("#keyList .pager-nav").get_by_text("首页", exact=True).first.click()
+        page.set_viewport_size({"width": 1600, "height": 1000})
+        page.wait_for_timeout(200)
+        check("masked hint renders inline", page.locator("#keyList .key-masked").count() == 10,
+              page.locator("#keyList .key-masked").count())
+        geo = page.evaluate(GEO_JS)
+        check("every key row is measured", len(geo) == 10, len(geo))
+        # A wrapped row stacks controls onto separate lines, so the centre points of
+        # the first and last child drift apart and the card grows taller.
+        check("all controls sit on the same line (no wrap)",
+              all(g["cyMax"] - g["cyMin"] < 2 for g in geo),
+              [round(g["cyMax"] - g["cyMin"], 1) for g in geo])
+        check("row height proves a single line", all(g["height"] < 52 for g in geo),
+              [round(g["height"], 1) for g in geo])
+        # Nine nodes: name, key, copy, realm, enable, generate, delete, dropdown, masked.
+        check("the key row holds all nine controls",
+              all(g["count"] == 9 for g in geo), [g["count"] for g in geo])
+        check("no control overlaps another", all(not overlaps(g) for g in geo),
+              [overlaps(g) for g in geo][:3])
+
+        print("key row on a narrow viewport")
+        # Below the breakpoint the row may wrap rather than scroll sideways, but a
+        # wrap must never mean an overlap.
+        page.set_viewport_size({"width": 900, "height": 1000})
+        page.wait_for_timeout(200)
+        narrow = page.evaluate(GEO_JS)
+        check("narrow rows still hold every control",
+              all(g["count"] == 9 for g in narrow), [g["count"] for g in narrow])
+        check("nothing overlaps once the row wraps", all(not overlaps(g) for g in narrow),
+              [overlaps(g) for g in narrow][:3])
+        page.set_viewport_size({"width": 1280, "height": 900})
 
         check("no page errors after interacting", not errors, errors[:3])
         browser.close()

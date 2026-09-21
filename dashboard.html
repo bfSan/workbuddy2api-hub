@@ -88,6 +88,43 @@ tbody tr:hover{background:rgba(241,245,249,.6)}
 .pager-gap{color:var(--dim);font-size:11px;padding:0 2px}
 .pager-size{font:inherit;font-size:11px;padding:4px 7px;border-radius:7px;
   border:1px solid var(--line);background:var(--panel2);color:var(--fg);cursor:pointer;margin-left:auto}
+
+/* Sortable table headers */
+th.sortable{cursor:pointer;user-select:none;transition:color .12s ease}
+th.sortable:hover{color:var(--fg)}
+th.sortable.active{color:var(--accent)}
+th.sortable .sort-glyph{display:inline-block;margin-left:4px;
+  color:var(--dim);font-size:10px;opacity:.45}
+th.sortable.active .sort-glyph{opacity:1;color:var(--accent)}
+
+/* One API key per row: every control stays on a single line */
+.keyrow{display:flex;gap:8px;align-items:center;flex-wrap:nowrap;
+  background:var(--panel2);border:1px solid var(--line);border-radius:10px;
+  padding:8px 10px;margin-bottom:8px}
+.keyrow > *{min-width:0;flex-shrink:0}
+.key-name{width:108px;background:var(--panel);border:1px solid var(--line);
+  border-radius:7px;padding:6px 9px;color:var(--fg);font:inherit;font-size:12px}
+.key-value{flex:1 1 120px;min-width:120px;background:var(--panel);
+  border:1px solid var(--line);border-radius:7px;padding:6px 9px;
+  color:var(--fg);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+.key-realm{width:118px;background:var(--panel);border:1px solid var(--line);
+  border-radius:7px;padding:6px 8px;color:var(--fg);font:inherit;font-size:12px}
+.key-enable{display:inline-flex;align-items:center;gap:5px;font-size:12px;
+  color:var(--dim);white-space:nowrap}
+.key-masked{font-size:11px;color:var(--dim);white-space:nowrap;cursor:default}
+.kac-wrap{position:relative}
+.kac-trigger{display:inline-flex;align-items:center;gap:6px;font-size:12px;
+  color:var(--fg);background:var(--panel);border:1px solid var(--line);
+  border-radius:8px;padding:5px 10px;cursor:pointer;max-width:210px}
+.kac-label{color:var(--dim);white-space:nowrap}
+.kac-sum{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.kac-caret{font-size:10px;color:var(--dim)}
+/* Below this width the controls genuinely cannot shrink further, so wrapping
+   beats an unusable horizontal scroll. */
+@media (max-width:1180px){
+  .keyrow{flex-wrap:wrap}
+  .key-value{flex:1 1 200px}
+}
 button{cursor:pointer;font:inherit;font-size:12px;font-weight:500;padding:6px 14px;border-radius:8px;
   border:1px solid var(--accent);background:var(--accent);color:#fff;box-shadow:var(--shadow-sm);transition:all .15s ease}
 button:hover{background:var(--accent-hover);border-color:var(--accent-hover)}
@@ -1558,20 +1595,50 @@ function filterByQuery(list, q, hayFn){
     return String(hayFn(row) || '').toLowerCase().indexOf(needle) >= 0;
   });
 }
+
+// Ties fall back to the original position so re-sorting the same list twice
+// cannot shuffle rows that compare equal, and Array.prototype.sort stability
+// stops mattering.
+function sortRows(list, keyFn, dir){
+  var sign = dir === 'desc' ? -1 : 1;
+  return (list || []).map(function(row, i){ return { row: row, i: i }; })
+    .sort(function(a, b){
+      var x = keyFn(a.row);
+      var y = keyFn(b.row);
+      if(typeof x === 'number' && typeof y === 'number'){
+        if(x !== y) return (x - y) * sign;
+      } else {
+        var c = String(x).localeCompare(String(y), 'zh-Hans-CN');
+        if(c) return c * sign;
+      }
+      return a.i - b.i;
+    })
+    .map(function(e){ return e.row; });
+}
 /* pagination-core:end */
 
 var PAGE_STORE = 'wb-proxy-page';
-var PAGE_STATE = { accounts: { page: 1, q: '' }, keys: { page: 1 } };
+var PAGE_STATE = {
+  accounts: { page: 1, q: '', sort: { key: '', dir: '' } },
+  keys: { page: 1 },
+};
 var PAGE_SIZE = { accounts: 10, keys: 10 };
 
 try {
   var savedPage = JSON.parse(localStorage.getItem(PAGE_STORE) || 'null');
   if(savedPage && savedPage.size){ PAGE_SIZE = savedPage.size; }
+  // Older builds only persisted { size }, so the sort key arrives as undefined.
+  if(savedPage && savedPage.sort && savedPage.sort.accounts){
+    PAGE_STATE.accounts.sort = savedPage.sort.accounts;
+  }
 } catch(e) { /* first run or a private-mode storage refusal */ }
 
 function persistPageSize(){
   try {
-    localStorage.setItem(PAGE_STORE, JSON.stringify({ size: PAGE_SIZE }));
+    localStorage.setItem(PAGE_STORE, JSON.stringify({
+      size: PAGE_SIZE,
+      sort: { accounts: PAGE_STATE.accounts.sort },
+    }));
   } catch(e) { /* non-fatal: the default page size still applies */ }
 }
 
@@ -1690,14 +1757,101 @@ function accountRow(a){
     + '</td></tr>';
 }
 
+// Column model for the account table. `key` marks a sortable header; the
+// action column stays unsorted. `desc` is the friendlier first click for
+// counters and balances, where the interesting rows are the big ones.
+var ACCT_COLS = [
+  { key: 'realm',    label: '版本',      align: 'center', width: '76px',  desc: false },
+  { key: 'name',     label: '账号',      align: 'left',   width: '',      desc: false },
+  { key: 'state',    label: '状态',      align: 'center', width: '84px',  desc: false },
+  { key: 'credit',   label: '积分额度',  align: 'left',   width: '120px', desc: true },
+  { key: 'requests', label: '请求',      align: 'right',  width: '70px',  desc: true },
+  { key: 'tokens',   label: '总 token',  align: 'right',  width: '88px',  desc: true },
+  { key: 'cached',   label: '缓存',      align: 'right',  width: '80px',  desc: true },
+  { key: '',         label: '操作',      align: 'right',  width: '230px', desc: false },
+];
+
+// Mirrors the badge precedence in accountRow so the order matches what the
+// eye sees: a disabled account is worse than a cooling one even if both also
+// look "expired".
+function acctStateRank(a){
+  if(!a.enabled) return 3;
+  if(a.inCooldown) return 2;
+  if(a.expiresIn === 'expired') return 1;
+  return 0;
+}
+
+function acctSortValue(a, key){
+  const usage = USAGE_BY_ACCOUNT[a.uid] || {};
+  switch(key){
+    // A missing balance sorts below every real number, including a spent 0.
+    case 'credit': return a.credits ? Number(a.credits.remain) || 0 : -Infinity;
+    case 'requests': return Number(usage.requests) || 0;
+    case 'tokens': return Number(usage.total_tokens) || 0;
+    case 'cached': return Number(usage.cached_tokens) || 0;
+    case 'state': return acctStateRank(a);
+    case 'realm': return a.realm === 'cn' ? 1 : 0;
+    case 'name': return accName(a).toLowerCase();
+    default: return '';
+  }
+}
+
+function sortByAccount(key){
+  const st = PAGE_STATE.accounts;
+  const col = ACCT_COLS.find(function(c){ return c.key === key; });
+  if(!col) return;
+  const preferred = col.desc ? 'desc' : 'asc';
+  if(st.sort.key !== key){
+    st.sort = { key: key, dir: preferred };
+  } else {
+    // Three-state cycle on the column's own axis: preferred direction, then the
+    // opposite, then no sort. Deriving the second step from `preferred` rather
+    // than hardcoding asc/desc keeps numeric columns reachable in ascending;
+    // a fixed `dir === 'asc'` test made 积分 and 请求 desc-or-nothing.
+    const other = preferred === 'asc' ? 'desc' : 'asc';
+    st.sort = st.sort.dir === other
+      ? { key: '', dir: '' }
+      : { key: key, dir: other };
+  }
+  st.page = 1;
+  persistPageSize();
+  renderAccounts();
+}
+
+function acctHeadHtml(){
+  const sort = PAGE_STATE.accounts.sort || { key: '', dir: '' };
+  return ACCT_COLS.map(function(col){
+    const style = 'text-align:' + col.align + ';' + (col.width ? ('width:' + col.width) : '');
+    if(!col.key){
+      return '<th style="' + style + '">' + col.label + '</th>';
+    }
+    const active = sort.key === col.key;
+    const glyph = !active ? '⇅' : (sort.dir === 'asc' ? '▲' : '▼');
+    const hint = !active
+      ? ('按' + col.label + '排序')
+      : (sort.dir === 'asc' ? (col.label + '升序，点击降序') : (col.label + '降序，点击取消排序'));
+    return '<th class="sortable' + (active ? ' active' : '') + '"'
+      + ' id="th-accounts-' + col.key + '"'
+      + ' style="' + style + '" title="' + esc(hint) + '"'
+      + ' onclick="sortByAccount(&quot;' + col.key + '&quot;)">'
+      + '<span>' + col.label + '</span>'
+      + '<span class="sort-glyph">' + glyph + '</span></th>';
+  }).join('');
+}
+
 function renderAccounts(){
   const box = document.getElementById('accounts');
   const all = window.ACCOUNTS || [];
   const st = PAGE_STATE.accounts;
   const realmList = all.filter(a => !a.realm || a.realm === (window.VIEW_REALM || "intl"));
   const filtered = filterByQuery(realmList, st.q, accountHay);
-  const view = applyView('accounts', filtered);
-  const usable = filtered.filter(a => a.enabled).length;
+  // Sort before slicing: a page-relative sort would reorder page 1 and page 2
+  // against each other and disagree with the header indicator.
+  const sorted = (st.sort && st.sort.key)
+    ? sortRows(filtered, function(a){ return acctSortValue(a, st.sort.key); }, st.sort.dir)
+    : filtered;
+  const view = applyView('accounts', sorted);
+  const usable = sorted.filter(a => a.enabled).length;
 
   // renderAccounts() also runs from the 15s poll, so redraw the box from state
   // rather than assuming the DOM already matches it.
@@ -1732,15 +1886,7 @@ function renderAccounts(){
     box.innerHTML = '<div class="empty">当前出口下没有匹配「' + esc(st.q) + '」的账号</div>';
     return;
   }
-  box.innerHTML = '<table><thead><tr>'
-    + '<th style="text-align:center;width:76px">版本</th>'
-    + '<th style="text-align:left">账号</th>'
-    + '<th style="text-align:center;width:84px">状态</th>'
-    + '<th style="text-align:left;width:120px">积分额度</th>'
-    + '<th style="text-align:right;width:70px">请求</th>'
-    + '<th style="text-align:right;width:88px">总 token</th>'
-    + '<th style="text-align:right;width:80px">缓存</th>'
-    + '<th style="text-align:right;width:230px">操作</th>'
+  box.innerHTML = '<table><thead><tr>' + acctHeadHtml()
     + '</tr></thead><tbody>' + view.items.map(r => accountRow(r.item)).join('') + '</tbody></table>'
     + pagerHtml('accounts', view)
     + '<div class="legend"><span>多个账号按会话粘性 + 轮询使用；某个账号被上游拒绝时自动切到下一个</span></div>';
@@ -2673,13 +2819,13 @@ function keyAccountDropdown(index, row, flip){
   }
   var open = KEY_ACCT_UI.open === index;
   var anchor = flip ? 'bottom:calc(100% + 4px)' : 'top:calc(100% + 4px)';
-  return '<div class="kac-wrap" style="position:relative;width:100%">'
-    + '<button type="button" onclick="event.stopPropagation();toggleKeyAccountPanel(' + index + ')"'
-    + ' style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--fg);'
-    + ' background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:5px 10px;cursor:pointer">'
-    + '<span style="color:var(--dim)">限定账号</span>'
-    + '<span id="kac-sum-' + index + '">' + esc(keyAccountSummary(index)) + '</span>'
-    + '<span>▾</span></button>'
+  // The trigger stays inline: a width:100% wrapper would force the row to wrap.
+  return '<div class="kac-wrap">'
+    + '<button type="button" class="kac-trigger" '
+    + ' onclick="event.stopPropagation();toggleKeyAccountPanel(' + index + ')">'
+    + '<span class="kac-label">限定账号</span>'
+    + '<span id="kac-sum-' + index + '" class="kac-sum">' + esc(keyAccountSummary(index)) + '</span>'
+    + '<span class="kac-caret">▾</span></button>'
     + '<div id="kac-panel-' + index + '" onclick="event.stopPropagation()"'
     + ' style="display:' + (open ? 'block' : 'none') + ';position:absolute;z-index:80;left:0;' + anchor + ';'
     + ' min-width:280px;background:var(--panel);border:1px solid var(--line);border-radius:10px;'
@@ -2750,22 +2896,18 @@ function keyRowHtml(row, i, flip){
       '<option value="' + value + '"' + (row.realm === value ? ' selected' : '') + '>' + label + '</option>'
     ).join('');
     const maskedHint = row.masked
-      ? '<span style="color:var(--dim);font-size:11px">已保存: ' + esc(row.masked) + '</span>'
+      ? '<span class="key-masked" title="已保存的 Key: ' + esc(row.masked) + '">已保存</span>'
       : '';
-    return '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;'
-      + 'background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:8px">'
-      + '<input type="text" value="' + esc(row.name || '') + '" placeholder="备注名" '
-      +   'oninput="updateKeyRow(' + i + ',\'name\', this.value)" '
-      +   'style="width:130px;background:var(--panel);border:1px solid var(--line);border-radius:7px;padding:6px 9px;color:var(--fg);font:inherit">'
-      + '<input type="text" value="' + esc(row.key || '') + '" placeholder="API Key（留空表示不改）" '
-     +   'oninput="updateKeyRow(' + i + ',\'key\', this.value)" '
-      +   'style="flex:1;min-width:190px;background:var(--panel);border:1px solid var(--line);border-radius:7px;padding:6px 9px;color:var(--fg);font:inherit">'
+    return '<div class="keyrow">'
+      + '<input class="key-name" type="text" value="' + esc(row.name || '') + '" placeholder="备注名" '
+      +   'oninput="updateKeyRow(' + i + ',\'name\', this.value)">'
+      + '<input class="key-value" type="text" value="' + esc(row.key || '') + '" placeholder="API Key（留空表示不改）" '
+      +   'oninput="updateKeyRow(' + i + ',\'key\', this.value)">'
       + '<button class="sec mini" id="copyBtn' + i + '" onclick="copyKeyRow(' + i + ')">复制</button>'
-      + '<select onchange="updateKeyRow(' + i + ',\'realm\', this.value)" '
-      +   'style="background:var(--panel);border:1px solid var(--line);border-radius:7px;padding:6px 9px;color:var(--fg);font:inherit">'
+      + '<select class="key-realm" onchange="updateKeyRow(' + i + ',\'realm\', this.value)">'
       + options + '</select>'
-      + '<label style="display:flex;align-items:center;gap:5px;font-size:12px;color:var(--dim)">'
-      +   '<input type="checkbox"' + (row.enabled ? ' checked' : '') + ' onchange="updateKeyRow(' + i + ',\'enabled\', this.checked)">启用</label>'
+      + '<label class="key-enable"><input type="checkbox"' + (row.enabled ? ' checked' : '')
+      +   ' onchange="updateKeyRow(' + i + ',\'enabled\', this.checked)">启用</label>'
       + '<button class="sec mini" onclick="generateKeyRow(' + i + ')">随机生成</button>'
       + '<button class="danger mini" onclick="removeKeyRow(' + i + ')">删除</button>'
       + keyAccountDropdown(i, row, flip)
