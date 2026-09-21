@@ -12,6 +12,7 @@ Only the Python standard library is required.
     python wb_proxy.py --api-key sk-local # require a bearer token
 """
 import argparse
+import base64
 import hashlib
 from collections import deque
 import re
@@ -2438,6 +2439,47 @@ CUSTOM_TOOL_HINT = (
     "it in markdown code fences, do not add commentary."
 )
 
+COMPACTION_ENCRYPTED_PREFIX = "wb-compaction-v1:"
+COMPACTION_PROMPT = (
+    "Summarize the entire conversation above into a compact handoff for continuing "
+    "the task. Preserve the user's requirements, decisions, relevant file paths, "
+    "code changes, commands, test results, unresolved issues, and next steps. "
+    "Return only the summary text."
+)
+
+
+def is_compaction_request(payload):
+    """Whether a Responses request asks for Codex remote-compaction output."""
+    inp = payload.get("input")
+    if not isinstance(inp, list):
+        return False
+    return any(
+        isinstance(item, dict) and item.get("type") == "compaction_trigger"
+        for item in inp
+    )
+
+
+def encode_compaction_summary(text):
+    raw = json.dumps(
+        {"summary": text or ""}, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    return COMPACTION_ENCRYPTED_PREFIX + encoded
+
+
+def decode_compaction_summary(value):
+    if not isinstance(value, str) or not value.startswith(COMPACTION_ENCRYPTED_PREFIX):
+        return None
+    encoded = value[len(COMPACTION_ENCRYPTED_PREFIX):]
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        raw = base64.urlsafe_b64decode((encoded + padding).encode("ascii"))
+        obj = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    summary = obj.get("summary") if isinstance(obj, dict) else None
+    return summary if isinstance(summary, str) else None
+
 
 def _is_custom_tool(tool):
     return isinstance(tool, dict) and str(tool.get("type") or "").lower() == "custom"
@@ -2509,6 +2551,7 @@ def responses_to_chat(payload):
     messages = []
     pending_tool_calls = set()
     deferred_messages = []
+    compaction_request = is_compaction_request(payload)
 
     def append_message(message):
         if pending_tool_calls:
@@ -2644,11 +2687,24 @@ def responses_to_chat(payload):
                     "tool_call_id": call_id,
                     "content": content,
                 }, call_id)
+            elif itype in ("compaction", "compaction_summary", "context_compaction"):
+                summary = decode_compaction_summary(item.get("encrypted_content"))
+                if summary:
+                    append_message({
+                        "role": "user",
+                        "content": "Conversation summary from earlier context:\n" + summary,
+                    })
+            elif itype == "compaction_trigger":
+                # Request control, not a conversational item. The summary
+                # instruction is appended after the full history below.
+                pass
             else:
                 # Never silently drop an unknown item: a dropped tool call or
                 # tool result leaves the transcript inconsistent upstream.
                 log("responses: WARNING unhandled input item type=%r keys=%s"
                     % (itype, sorted(item.keys())[:8]))
+    if compaction_request:
+        append_message({"role": "user", "content": COMPACTION_PROMPT})
     chat = {"model": payload.get("model"), "messages": messages}
     for key in ("temperature", "top_p", "seed"):
         if payload.get(key) is not None:
@@ -2663,11 +2719,11 @@ def responses_to_chat(payload):
         effort = payload.get("reasoning_effort")
     if effort:
         chat["reasoning_effort"] = effort
-    if payload.get("tools"):
+    if payload.get("tools") and not compaction_request:
         chat["tools"] = _tools_for_chat(payload["tools"])
-    if payload.get("tool_choice"):
+    if payload.get("tool_choice") and not compaction_request:
         chat["tool_choice"] = payload["tool_choice"]
-    if payload.get("parallel_tool_calls") is not None:
+    if payload.get("parallel_tool_calls") is not None and not compaction_request:
         chat["parallel_tool_calls"] = payload["parallel_tool_calls"]
     return chat
 def _responses_usage(u):
@@ -2769,6 +2825,120 @@ def chat_to_response(chat_obj, model, custom_names=None):
     if finish == "length":
         obj["incomplete_details"] = {"reason": "max_output_tokens"}
     return obj
+
+
+def compaction_response_item(text):
+    return {
+        "id": _new_id("cmp_"),
+        "type": "compaction",
+        "encrypted_content": encode_compaction_summary(text),
+    }
+
+
+def chat_to_compaction_response(chat_obj, model):
+    """Fold a chat summary into the one compaction item Codex expects."""
+    choice = (chat_obj.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    text = (msg.get("content") or msg.get("reasoning_content") or "").strip()
+    obj = {
+        "id": _new_id("resp_"),
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "completed",
+        "model": model,
+        "output": [compaction_response_item(text)],
+        "output_text": "",
+        "parallel_tool_calls": False,
+        "tool_choice": "none",
+        "tools": [],
+        "metadata": {},
+    }
+    u = _responses_usage(chat_obj.get("usage"))
+    if u:
+        obj["usage"] = u
+    return obj
+
+
+def stream_compaction_response_events(upstream, model, holder):
+    """Yield a Responses SSE stream containing exactly one compaction item."""
+    resp_id = _new_id("resp_")
+    item_id = _new_id("cmp_")
+    created = int(time.time())
+    seq = 0
+    text_parts, reason_parts = [], []
+    finish = "stop"
+    usage = None
+
+    def resp_obj(status, item=None):
+        obj = {
+            "id": resp_id,
+            "object": "response",
+            "created_at": created,
+            "status": status,
+            "model": model,
+            "output": [item] if item else [],
+            "output_text": "",
+            "parallel_tool_calls": False,
+            "tool_choice": "none",
+            "tools": [],
+            "metadata": {},
+        }
+        u = _responses_usage(usage)
+        if u:
+            obj["usage"] = u
+        return obj
+
+    def ev(etype, payload):
+        nonlocal seq
+        seq += 1
+        data = {"type": etype, "sequence_number": seq}
+        data.update(payload)
+        return (
+            "event: " + etype + chr(10)
+            + "data: " + json.dumps(data, ensure_ascii=False) + chr(10) + chr(10)
+        ).encode("utf-8")
+
+    yield ev("response.created", {"response": resp_obj("in_progress")})
+    yield ev("response.in_progress", {"response": resp_obj("in_progress")})
+    for raw in upstream:
+        data = strip_data_prefix(raw.decode("utf-8", "replace"))
+        if not data or data == "[DONE]":
+            continue
+        try:
+            chunk = json.loads(data)
+        except Exception:
+            continue
+        if chunk.get("usage"):
+            usage = chunk["usage"]
+            holder["usage"] = usage
+        for choice in chunk.get("choices") or []:
+            delta = choice.get("delta") or {}
+            if delta.get("content"):
+                text_parts.append(delta["content"])
+            if delta.get("reasoning_content"):
+                reason_parts.append(delta["reasoning_content"])
+            if choice.get("finish_reason"):
+                finish = choice["finish_reason"]
+
+    text = "".join(text_parts).strip() or "".join(reason_parts).strip()
+    item = compaction_response_item(text)
+    yield ev("response.output_item.added", {
+        "output_index": 0,
+        "item": {
+            "id": item_id,
+            "type": "compaction",
+            "encrypted_content": "",
+        },
+    })
+    item["id"] = item_id
+    yield ev("response.output_item.done", {"output_index": 0, "item": item})
+    status = "completed" if finish != "length" else "incomplete"
+    final = resp_obj(status, item)
+    if finish == "length":
+        final["incomplete_details"] = {"reason": "max_output_tokens"}
+    yield ev("response.completed", {"response": final})
+
+
 def stream_responses_events(upstream, model, holder):
     """Yield Responses-API SSE frames translated from chat-completions chunks."""
     resp_id, msg_id, rs_id = _new_id("resp_"), _new_id("msg_"), _new_id("rs_")
@@ -3953,6 +4123,7 @@ class Handler(BaseHTTPRequestHandler):
         session_key = extract_session_key(self.headers, payload)
         # PATCH(wb-hub-key-accounts) 会话粘性隔离到租户维度
         session_key = wb_patch_tenant_session_key(session_key, self.key_entry)
+        compaction_request = is_compaction_request(payload)
         custom_names = custom_tool_names(payload.get("tools"))
         chat_req = responses_to_chat(payload)
         model = payload.get("model") or "deepseek-v4.1-flash"
@@ -4000,7 +4171,12 @@ class Handler(BaseHTTPRequestHandler):
                 holder = {"usage": None, "custom_names": custom_names}
                 first_ms = None
                 try:
-                    for frame in stream_responses_events(upstream, model, holder):
+                    stream = (
+                        stream_compaction_response_events(upstream, model, holder)
+                        if compaction_request
+                        else stream_responses_events(upstream, model, holder)
+                    )
+                    for frame in stream:
                         if first_ms is None:
                             first_ms = int((time.time() - t_start) * 1000)
                         # PATCHED-BY-OPS: 与 chat completions 路径对齐，清洗噪音帧
@@ -4028,7 +4204,11 @@ class Handler(BaseHTTPRequestHandler):
                              elapsed_ms=int((time.time() - t_start) * 1000))
                 return self._error(502, f"upstream stream error: {exc}")
             wall = int((time.time() - t_start) * 1000)
-            result = chat_to_response(chat_obj, model, custom_names)
+            result = (
+                chat_to_compaction_response(chat_obj, model)
+                if compaction_request
+                else chat_to_response(chat_obj, model, custom_names)
+            )
             record_usage(model, chat_obj.get("usage"), stream=False, elapsed_ms=wall, fp=fp,
                          account=account.uid)
             return self._json(200, result)
