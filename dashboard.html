@@ -77,6 +77,17 @@ tbody tr:hover{background:rgba(241,245,249,.6)}
 .legend{display:flex;gap:16px;color:var(--dim);font-size:11px;margin-top:12px;flex-wrap:wrap}
 .legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:middle}
 .toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.toolbar input[type=search]{flex:1;min-width:160px;max-width:280px;font:inherit;font-size:12px;
+  padding:6px 11px;border-radius:8px;border:1px solid var(--line);background:var(--panel2);color:var(--fg)}
+.toolbar input[type=search]:focus{outline:none;border-color:var(--accent);background:#fff}
+.pager{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:12px}
+.pager-info{font-size:11px;color:var(--dim);white-space:nowrap}
+.pager-nav{display:flex;align-items:center;gap:4px;flex-wrap:wrap}
+.pager-nav button.mini{min-width:26px;padding:3px 7px}
+.pager-nav button.mini.active{background:var(--accent);border-color:var(--accent);color:#fff;cursor:default}
+.pager-gap{color:var(--dim);font-size:11px;padding:0 2px}
+.pager-size{font:inherit;font-size:11px;padding:4px 7px;border-radius:7px;
+  border:1px solid var(--line);background:var(--panel2);color:var(--fg);cursor:pointer;margin-left:auto}
 button{cursor:pointer;font:inherit;font-size:12px;font-weight:500;padding:6px 14px;border-radius:8px;
   border:1px solid var(--accent);background:var(--accent);color:#fff;box-shadow:var(--shadow-sm);transition:all .15s ease}
 button:hover{background:var(--accent-hover);border-color:var(--accent-hover)}
@@ -281,7 +292,10 @@ a:hover{text-decoration:underline}
     <button class="sec" onclick="queryCredits(this)">刷新额度/积分</button>
     <button class="sec" onclick="setAll(true, this)">全部启用</button>
     <button class="sec" onclick="setAll(false, this)">全部停用</button>
-    
+    <input type="search" id="acctSearch" placeholder="搜索昵称 / 备注 / uid / 设备码"
+           oninput="filterAccounts(this.value)" autocomplete="off"
+           aria-label="搜索账号">
+
   </div>
     <div id="accounts"></div>
   </section>
@@ -761,6 +775,9 @@ function updateUI(){
 async function switchViewRealm(r){
   if(window.VIEW_REALM === r) return;
   window.VIEW_REALM = r;
+  // Another realm is a different row set, so land on page 1 rather than
+  // whatever page the previous realm happened to leave open.
+  PAGE_STATE.accounts.page = 1;
   window.updateUI();
   await loadAccounts();
   await loadModels();
@@ -1480,6 +1497,151 @@ function toast(msg, kind){
 }
 
 /* ------------------------------- accounts ------------------------------- */
+/* ---------------------------------------------------------------------- */
+/* Shared pagination. These lists grew large enough to scroll for ages, so */
+/* both the account table and the API key editor slice a page out of the   */
+/* full array they already hold. The server endpoints are untouched.       */
+/* ---------------------------------------------------------------------- */
+
+/* pagination-core:begin */
+var PAGE_SIZES = [20, 50, 100];
+
+function clampSize(n){
+  n = Number(n);
+  return PAGE_SIZES.indexOf(n) >= 0 ? n : PAGE_SIZES[0];
+}
+
+// Returns absolute indices alongside each row. The API key editor addresses
+// rows by their position in API_KEY_ROWS, so a page-relative index would make
+// an edit on page 2 land on a key from page 1.
+function paginate(list, state, pageSize){
+  const size = clampSize(pageSize);
+  const total = (list || []).length;
+  const pages = Math.max(1, Math.ceil(total / size));
+  const page = Math.min(Math.max(1, (state && state.page) || 1), pages);
+  const first = (page - 1) * size;
+  const last = Math.min(total, first + size);
+  const items = [];
+  for(var i = first; i < last; i++) items.push({ item: list[i], index: i });
+  return {
+    items: items, page: page, pages: pages, total: total, size: size,
+    start: total ? first + 1 : 0, end: last,
+  };
+}
+
+// Numbers plus '…' gap markers, capped at `slots` entries.
+function pageWindow(cur, pages, slots){
+  slots = slots || 7;
+  if(pages <= 1) return [1];
+  if(pages <= slots){
+    var all = [];
+    for(var p = 1; p <= pages; p++) all.push(p);
+    return all;
+  }
+  var inner = Math.max(1, slots - 4);
+  var lo = Math.max(2, cur - Math.floor(inner / 2));
+  var hi = Math.min(pages - 1, lo + inner - 1);
+  lo = Math.max(2, hi - inner + 1);
+  var out = [1];
+  if(lo > 2) out.push('…');
+  for(var q = lo; q <= hi; q++) out.push(q);
+  if(hi < pages - 1) out.push('…');
+  out.push(pages);
+  return out;
+}
+
+function filterByQuery(list, q, hayFn){
+  var needle = String(q || '').trim().toLowerCase();
+  var rows = list || [];
+  if(!needle) return rows.slice();
+  return rows.filter(function(row){
+    return String(hayFn(row) || '').toLowerCase().indexOf(needle) >= 0;
+  });
+}
+/* pagination-core:end */
+
+var PAGE_STORE = 'wb-proxy-page';
+var PAGE_STATE = { accounts: { page: 1, q: '' }, keys: { page: 1 } };
+var PAGE_SIZE = { accounts: 20, keys: 20 };
+
+try {
+  var savedPage = JSON.parse(localStorage.getItem(PAGE_STORE) || 'null');
+  if(savedPage && savedPage.size){ PAGE_SIZE = savedPage.size; }
+} catch(e) { /* first run or a private-mode storage refusal */ }
+
+function persistPageSize(){
+  try {
+    localStorage.setItem(PAGE_STORE, JSON.stringify({ size: PAGE_SIZE }));
+  } catch(e) { /* non-fatal: the default page size still applies */ }
+}
+
+function pageSizeFor(ref){ return clampSize(PAGE_SIZE[ref] || PAGE_SIZES[0]); }
+
+// Clamp against the live row count so deleting the last row of the final page
+// does not leave an empty table on screen.
+function applyView(ref, list){
+  const st = PAGE_STATE[ref];
+  const view = paginate(list, st, pageSizeFor(ref));
+  st.page = view.page;
+  return view;
+}
+
+function gotoPage(ref, page){
+  PAGE_STATE[ref].page = page;
+  if(ref === 'keys'){ KEY_ACCT_UI.open = -1; KEY_ACCT_UI.filter = ''; }
+  renderPage(ref);
+}
+
+function setPageSize(ref, size){
+  PAGE_SIZE[ref] = clampSize(size);
+  PAGE_STATE[ref].page = 1;
+  persistPageSize();
+  renderPage(ref);
+}
+
+function renderPage(ref){
+  if(ref === 'accounts') renderAccounts();
+  else if(ref === 'keys') renderKeyRows();
+}
+
+function pagerHtml(ref, view){
+  const sizes = PAGE_SIZES.map(function(s){
+    return '<option value="' + s + '"' + (s === view.size ? ' selected' : '') + '>' + s + ' / 页</option>';
+  }).join('');
+  // The range line and the page-size control stay visible even on a single
+  // page. Dropping the selector once everything fits would strand the viewer
+  // at that size with no way back to a smaller page.
+  const info = '<div class="pager-info">'
+    + (view.total
+        ? ('第 ' + view.start + '-' + view.end + ' 条 / 共 ' + view.total + ' 条')
+        : '暂无数据')
+    + '</div>';
+  const sizeBox = '<select class="pager-size" aria-label="每页条数"'
+    + ' onchange="setPageSize(\'' + ref + '\', this.value)">' + sizes + '</select>';
+  if(view.pages <= 1) return '<div class="pager">' + info + sizeBox + '</div>';
+
+  const slots = pageWindow(view.page, view.pages).map(function(p){
+    if(p === '…') return '<span class="pager-gap">…</span>';
+    return '<button class="sec mini' + (p === view.page ? ' active' : '') + '"'
+      + ' onclick="gotoPage(\'' + ref + '\',' + p + ')">' + p + '</button>';
+  }).join('');
+  const nav = function(label, page, disabled){
+    return '<button class="sec mini" ' + (disabled ? 'disabled' : '')
+      + ' onclick="gotoPage(\'' + ref + '\',' + page + ')">' + label + '</button>';
+  };
+  return '<div class="pager">'
+    + info
+    + '<div class="pager-nav">'
+    +   nav('首页', 1, view.page === 1)
+    +   nav('上一页', view.page - 1, view.page === 1)
+    +   slots
+    +   nav('下一页', view.page + 1, view.page === view.pages)
+    +   nav('末页', view.pages, view.page === view.pages)
+    + '</div>'
+    + sizeBox
+    + '</div>';
+}
+
 let USAGE_BY_ACCOUNT = {};
 
 function accountRow(a){
@@ -1530,12 +1692,26 @@ function accountRow(a){
 
 function renderAccounts(){
   const box = document.getElementById('accounts');
-  const currentView = (window.VIEW_REALM || "intl");
-  let list = (window.ACCOUNTS || []).filter(a => !a.realm || a.realm === currentView);
-  const usable = list.filter(a => a.enabled).length;
-  document.getElementById('acctCount').textContent =
-    window.ACCOUNTS.length ? ('共 ' + window.ACCOUNTS.length + ' 个，启用 ' + usable + ' 个') : '';
-  if(!window.ACCOUNTS.length){
+  const all = window.ACCOUNTS || [];
+  const st = PAGE_STATE.accounts;
+  const realmList = all.filter(a => !a.realm || a.realm === (window.VIEW_REALM || "intl"));
+  const filtered = filterByQuery(realmList, st.q, accountHay);
+  const view = applyView('accounts', filtered);
+  const usable = filtered.filter(a => a.enabled).length;
+
+  // renderAccounts() also runs from the 15s poll, so redraw the box from state
+  // rather than assuming the DOM already matches it.
+  const searchBox = document.getElementById('acctSearch');
+  if(searchBox && searchBox.value !== st.q) searchBox.value = st.q;
+
+  const countEl = document.getElementById('acctCount');
+  if(countEl){
+    countEl.textContent = !all.length ? '' : (st.q
+      ? ('筛选 ' + filtered.length + ' / ' + realmList.length + ' 个，启用 ' + usable + ' 个')
+      : ('当前出口 ' + realmList.length + ' 个，启用 ' + usable + ' 个（全量 ' + all.length + '）'));
+  }
+
+  if(!all.length){
     box.innerHTML =
       '<div style="text-align:center;padding:30px 16px">'
       + '<div style="font-size:15px;margin-bottom:8px">还没有账号</div>'
@@ -1552,6 +1728,10 @@ function renderAccounts(){
       + '</div>';
     return;
   }
+  if(!filtered.length){
+    box.innerHTML = '<div class="empty">当前出口下没有匹配「' + esc(st.q) + '」的账号</div>';
+    return;
+  }
   box.innerHTML = '<table><thead><tr>'
     + '<th style="text-align:center;width:76px">版本</th>'
     + '<th style="text-align:left">账号</th>'
@@ -1561,8 +1741,22 @@ function renderAccounts(){
     + '<th style="text-align:right;width:88px">总 token</th>'
     + '<th style="text-align:right;width:80px">缓存</th>'
     + '<th style="text-align:right;width:230px">操作</th>'
-    + '</tr></thead><tbody>' + list.map(accountRow).join('') + '</tbody></table>'
+    + '</tr></thead><tbody>' + view.items.map(r => accountRow(r.item)).join('') + '</tbody></table>'
+    + pagerHtml('accounts', view)
     + '<div class="legend"><span>多个账号按会话粘性 + 轮询使用；某个账号被上游拒绝时自动切到下一个</span></div>';
+}
+
+function accountHay(a){
+  return [a.nickname, a.alias, accAlias(a.uid), a.uid, a.machineId, a.realm, a.source]
+    .filter(Boolean).join(' ');
+}
+
+function filterAccounts(q){
+  PAGE_STATE.accounts.q = q || '';
+  // A new query re-runs against the whole realm list, so page 1 is the honest
+  // landing spot rather than whatever page the previous query happened to sit on.
+  PAGE_STATE.accounts.page = 1;
+  renderAccounts();
 }
 
 async function loadAccounts(){
@@ -2339,6 +2533,11 @@ async function loadSettings(showToast){
     }));
     window.ACCOUNT_OPTIONS = data.account_options || [];
     window.ACCOUNT_ALIASES = data.account_aliases || {};
+    // The rows were just rebuilt from the server, so page 1 is the only
+    // position that is guaranteed to still exist.
+    PAGE_STATE.keys.page = 1;
+    KEY_ACCT_UI.open = -1;
+    KEY_ACCT_UI.filter = '';
     renderKeyRows();
     const set = (id, value) => { const el = document.getElementById(id); if(el) el.textContent = value || '-'; };
     set('setVersion', data.version);
@@ -2465,12 +2664,15 @@ function keyAccountListHtml(index){
   }).join('');
 }
 
-function keyAccountDropdown(index, row){
+// `flip` opens the panel upward. The last card on a page sits right above the
+// pager, and a downward panel there would cover it and eat the clicks.
+function keyAccountDropdown(index, row, flip){
   var opts = keyAccountOptions();
   if(!opts.length){
     return '<div style="width:100%;font-size:12px;color:var(--dim)">还没有可选账号，先到账号页登录</div>';
   }
   var open = KEY_ACCT_UI.open === index;
+  var anchor = flip ? 'bottom:calc(100% + 4px)' : 'top:calc(100% + 4px)';
   return '<div class="kac-wrap" style="position:relative;width:100%">'
     + '<button type="button" onclick="event.stopPropagation();toggleKeyAccountPanel(' + index + ')"'
     + ' style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--fg);'
@@ -2479,7 +2681,7 @@ function keyAccountDropdown(index, row){
     + '<span id="kac-sum-' + index + '">' + esc(keyAccountSummary(index)) + '</span>'
     + '<span>▾</span></button>'
     + '<div id="kac-panel-' + index + '" onclick="event.stopPropagation()"'
-    + ' style="display:' + (open ? 'block' : 'none') + ';position:absolute;z-index:80;left:0;top:calc(100% + 4px);'
+    + ' style="display:' + (open ? 'block' : 'none') + ';position:absolute;z-index:80;left:0;' + anchor + ';'
     + ' min-width:280px;background:var(--panel);border:1px solid var(--line);border-radius:10px;'
     + ' box-shadow:0 8px 24px rgba(0,0,0,.18);padding:6px">'
     + '<input id="kac-q-' + index + '" type="text" placeholder="搜索账号名 / uid"'
@@ -2543,14 +2745,7 @@ document.addEventListener('click', function(){
   }
 });
 
-function renderKeyRows(){
-  const box = document.getElementById('keyList');
-  if(!box) return;
-  if(!API_KEY_ROWS.length){
-    box.innerHTML = '<div class="empty" style="padding:14px 0">还没有配置 Key，点击下方按钮添加。</div>';
-    return;
-  }
-  box.innerHTML = API_KEY_ROWS.map((row, i) => {
+function keyRowHtml(row, i, flip){
     const options = REALM_CHOICES.map(([value, label]) =>
       '<option value="' + value + '"' + (row.realm === value ? ' selected' : '') + '>' + label + '</option>'
     ).join('');
@@ -2573,10 +2768,26 @@ function renderKeyRows(){
       +   '<input type="checkbox"' + (row.enabled ? ' checked' : '') + ' onchange="updateKeyRow(' + i + ',\'enabled\', this.checked)">启用</label>'
       + '<button class="sec mini" onclick="generateKeyRow(' + i + ')">随机生成</button>'
       + '<button class="danger mini" onclick="removeKeyRow(' + i + ')">删除</button>'
-      + keyAccountDropdown(i, row)
+      + keyAccountDropdown(i, row, flip)
       + maskedHint
       + '</div>';
-  }).join('');
+}
+
+// `i` must stay an index into API_KEY_ROWS, not a position on this page: every
+// inline handler and the open-account-dropdown state key off that index.
+function renderKeyRows(){
+  const box = document.getElementById('keyList');
+  if(!box) return;
+  if(!API_KEY_ROWS.length){
+    box.innerHTML = '<div class="empty" style="padding:14px 0">还没有配置 Key，点击下方按钮添加。</div>';
+    return;
+  }
+  const view = applyView('keys', API_KEY_ROWS);
+  // Only the final card on the page flips, so the panel never lands on the pager.
+  box.innerHTML = view.items.map(function(r, n){
+    return keyRowHtml(r.item, r.index, n === view.items.length - 1);
+  }).join('')
+    + pagerHtml('keys', view);
 }
 
 function updateKeyRow(index, field, value){
@@ -2640,11 +2851,18 @@ async function writeClipboard(text){
 
 function addApiKeyRow(){
   API_KEY_ROWS.push({id: '', name: '', key: '', realm: '', enabled: true, masked: ''});
+  // Land on the last page so the new row is actually visible; applyView()
+  // clamps this deliberate over-shoot down to the real final page.
+  PAGE_STATE.keys.page = API_KEY_ROWS.length;
   renderKeyRows();
 }
 
 function removeKeyRow(index){
   API_KEY_ROWS.splice(index, 1);
+  // Splicing shifts every later index, so an open picker could end up
+  // pointing at a different key.
+  KEY_ACCT_UI.open = -1;
+  KEY_ACCT_UI.filter = '';
   renderKeyRows();
 }
 

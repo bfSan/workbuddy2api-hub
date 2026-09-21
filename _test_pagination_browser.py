@@ -1,0 +1,286 @@
+"""Browser checks for dashboard pagination.
+
+_test_pagination.mjs covers the pure slicing logic. This covers the parts only a
+real DOM exposes: the 15s account poll must not bounce the viewer off their page,
+and the paged API key editor must keep addressing rows by absolute index.
+
+Run: .venv/bin/python _test_pagination_browser.py
+"""
+import http.server
+import json
+import os
+import socketserver
+import threading
+
+from playwright.sync_api import sync_playwright
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+PASS = FAIL = 0
+
+
+def check(label, cond, extra=""):
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print("  [PASS] " + label)
+    else:
+        FAIL += 1
+        print("  [FAIL] " + label + ("  " + str(extra) if extra else ""))
+
+
+ACCOUNTS = [{"uid": "intl%03d" % i, "nickname": "国际号%03d" % i, "realm": "intl",
+             "enabled": True, "source": "oauth", "expiresIn": "30d"} for i in range(63)]
+# The server hands back both realms and the panel filters client side, so the
+# realm toggle exercises the real path.
+CN_ACCOUNTS = [{"uid": "cn%03d" % i, "nickname": "国内号%03d" % i, "realm": "cn",
+                "enabled": True, "source": "oauth", "expiresIn": "30d"} for i in range(25)]
+ALL_ACCOUNTS = ACCOUNTS + CN_ACCOUNTS
+API_KEYS = [{"id": "k%02d" % i, "name": "key-%02d" % i, "masked": "wb-****%02d" % i,
+             "realm": "", "enabled": True, "accounts": []} for i in range(45)]
+
+SAVED = []
+
+API_PREFIXES = ("/panel", "/accounts", "/usage", "/settings", "/scheduler",
+                "/tasks", "/logs", "/realm", "/v1/models")
+
+
+def api_payload(path):
+    if path.startswith("/panel/status"):
+        return {"authenticated": True, "panel_password_is_default": False}
+    if path.startswith("/realm"):
+        return {"active_gateway_realm": "intl", "realms": ["intl", "cn"]}
+    if path.startswith("/accounts"):
+        return {"accounts": ALL_ACCOUNTS}
+    if path.startswith("/usage/by-account"):
+        return {"accounts": []}
+    if path.startswith("/usage/by-key"):
+        return {"keys": []}
+    if path.startswith("/usage/recent"):
+        return {"rows": []}
+    if path.startswith("/usage/perf") or path.startswith("/usage/analytics"):
+        return {}
+    if path.startswith("/usage"):
+        return {"total": {}, "models": []}
+    if path.startswith("/v1/models"):
+        return {"data": []}
+    if path.startswith("/settings/models"):
+        return {"hidden": [], "order": []}
+    if path.startswith("/settings"):
+        return {"api_keys": API_KEYS, "account_options": ACCOUNTS[:5],
+                "account_aliases": {}, "version": "test", "accounts_dir": "-",
+                "usage_dir": "-", "settings_file": "-", "api_key_set": False}
+    if path.startswith("/scheduler"):
+        return {"enabled": True, "times": []}
+    if path.startswith("/tasks"):
+        return {"tasks": []}
+    if path.startswith("/logs"):
+        return {"entries": [], "max_id": 0}
+    return {}
+
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=HERE, **kwargs)
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path.startswith(API_PREFIXES):
+            return self._json(api_payload(path))
+        if path in ("/", ""):
+            self.path = "/dashboard.html"
+        return http.server.SimpleHTTPRequestHandler.do_GET(self)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b"{}"
+        if self.path.startswith("/settings/save"):
+            try:
+                SAVED.append(json.loads(raw.decode("utf-8")))
+            except Exception:
+                SAVED.append({})
+        return self._json({"ok": True, "msg": "saved"})
+
+    def _json(self, obj):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+def rows(page):
+    return page.locator("#accounts tbody tr").count()
+
+
+def info(page):
+    return page.locator("#accounts .pager-info").first.inner_text().strip()
+
+
+def cards(page):
+    # The pager is also a direct child div, so count only the key cards.
+    return page.locator("#keyList > div:not(.pager)").count()
+
+
+def run_checks(base):
+    with sync_playwright() as p:
+        try:
+            browser = p.chromium.launch()
+        except Exception:
+            browser = p.chromium.launch(channel="chrome")
+        page = browser.new_page()
+        errors = []
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        page.goto(base, wait_until="networkidle")
+
+        check("panel unlocked and account list rendered", rows(page) > 0)
+        check("no page errors during boot", not errors, errors[:2])
+
+        print("account table")
+        check("page 1 shows one page of 20", rows(page) == 20, rows(page))
+        check("count line reads 1-20 of 63", info(page) == "第 1-20 条 / 共 63 条", info(page))
+        check("header reports the full pool across both realms",
+              "全量 88" in page.locator("#acctCount").inner_text(),
+              page.locator("#acctCount").inner_text())
+
+        page.locator("#accounts .pager-nav").get_by_text("3", exact=True).first.click()
+        check("jump to page 3 shows 20 rows", rows(page) == 20, rows(page))
+        check("page 3 count line reads 41-60", info(page) == "第 41-60 条 / 共 63 条", info(page))
+        check("page 3 starts at the 41st account",
+              "国际号040" in page.locator("#accounts tbody tr").first.inner_text(),
+              page.locator("#accounts tbody tr").first.inner_text()[:40])
+
+        # loadAccounts() re-enters renderAccounts() every 15s; the page must hold.
+        page.wait_for_timeout(17000)
+        check("15s poll did not bounce the viewer off page 3",
+              info(page) == "第 41-60 条 / 共 63 条", info(page))
+        check("polled page 3 still shows the same rows",
+              "国际号040" in page.locator("#accounts tbody tr").first.inner_text())
+
+        print("account search")
+        page.fill("#acctSearch", "国际号05")
+        check("search resets to page 1", info(page).startswith("第 1-10"), info(page))
+        check("search narrows to 10 rows", rows(page) == 10, rows(page))
+        check("header reflects the filter",
+              "筛选 10 / 63" in page.locator("#acctCount").inner_text(),
+              page.locator("#acctCount").inner_text())
+        page.fill("#acctSearch", "intl060")
+        check("search matches on uid", rows(page) == 1, rows(page))
+        page.fill("#acctSearch", "不存在的号")
+        check("no match shows an empty state",
+              "没有匹配" in page.locator("#accounts").inner_text())
+        page.fill("#acctSearch", "")
+        check("clearing search restores page 1", rows(page) == 20 and info(page) == "第 1-20 条 / 共 63 条",
+              info(page))
+
+        print("account page size")
+        page.select_option("#accounts .pager-size", "100")
+        check("100/page shows every account", rows(page) == 63, rows(page))
+        # 63 rows at 100/page is a single page; the selector must survive that.
+        check("page-size control stays available on a single page",
+              page.locator("#accounts .pager-size").count() == 1,
+              page.locator("#accounts .pager-size").count())
+        check("single page hides the page buttons",
+              page.locator("#accounts .pager-nav").count() == 0)
+        page.select_option("#accounts .pager-size", "20")
+        check("back to 20/page", rows(page) == 20, rows(page))
+
+        print("api key editor")
+        # PAGE_STATE is declared after switchViewRealm in the file, so this also
+        # proves the realm toggle can reach it at click time rather than at parse.
+        page.evaluate("() => { PAGE_STATE.accounts.page = 3; renderAccounts(); }")
+        check("page 3 is set before the realm switch",
+              info(page) == "第 41-60 条 / 共 63 条", info(page))
+        page.evaluate("() => switchViewRealm('cn')")
+        page.wait_for_timeout(500)
+        check("switching realm returns to page 1",
+              page.evaluate("() => PAGE_STATE.accounts.page") == 1,
+              page.evaluate("() => PAGE_STATE.accounts.page"))
+        check("cn view shows the cn pool from page 1",
+              info(page) == "第 1-20 条 / 共 25 条", info(page))
+        page.evaluate("() => switchViewRealm('intl')")
+        page.wait_for_timeout(500)
+        check("switching back starts clean",
+              info(page) == "第 1-20 条 / 共 63 条", info(page))
+
+        page.click("#btnNavSettings")
+        page.wait_for_selector("#keyList > div")
+        check("key page 1 shows 20 rows", cards(page) == 20, cards(page))
+        check("key pager reports 45 keys",
+              "第 1-20 条 / 共 45 条" in page.locator("#keyList .pager-info").inner_text(),
+              page.locator("#keyList .pager-info").inner_text())
+
+        page.locator("#keyList .pager-nav").get_by_text("3", exact=True).first.click()
+        check("key page 3 shows the 5-row remainder", cards(page) == 5, cards(page))
+        first_key = page.locator("#keyList input[placeholder='备注名']").first
+        check("key page 3 starts at key-40", first_key.input_value() == "key-40",
+              first_key.input_value())
+
+        # The last card is absolute row 44. Its dropdown must mutate row 44, not row 4.
+        page.locator("#keyList .kac-wrap").last.locator("button").first.click()
+        page.wait_for_selector("#kac-panel-44", state="visible")
+        # It anchors upward so it cannot cover the pager beneath the last card.
+        check("last row dropdown opens upward, clear of the pager",
+              page.eval_on_selector("#kac-panel-44",
+                                    "el => getComputedStyle(el).bottom !== 'auto'"))
+        page.locator("#kac-panel-44 input[type=checkbox]").first.click()
+        picked = page.evaluate("() => API_KEY_ROWS[44].accounts")
+        check("checking a box edited absolute row 44", len(picked) == 1, picked)
+        check("relative row 4 was left alone", page.evaluate("() => API_KEY_ROWS[4].accounts") == [])
+
+        # The pager is still clickable with that panel open.
+        page.locator("#keyList .pager-nav").get_by_text("首页", exact=True).first.click()
+        check("paging back to page 1",
+              "第 1-20 条 / 共 45 条" in page.locator("#keyList .pager-info").inner_text(),
+              page.locator("#keyList .pager-info").inner_text())
+        check("paging closed the account dropdown",
+              page.evaluate("() => KEY_ACCT_UI.open") == -1,
+              page.evaluate("() => KEY_ACCT_UI.open"))
+        page.locator("#keyList input[placeholder='备注名']").nth(2).fill("renamed-p1")
+        check("edit on page 1 landed on absolute row 2",
+              page.evaluate("() => API_KEY_ROWS[2].name") == "renamed-p1",
+              page.evaluate("() => API_KEY_ROWS[2].name"))
+
+        print("saving across pages")
+        page.get_by_text("保存全部", exact=True).click()
+        page.wait_for_timeout(700)
+        check("save fired once", len(SAVED) == 1, len(SAVED))
+        if SAVED:
+            keys = SAVED[0].get("api_keys") or []
+            check("save sent all 45 keys, not just the visible page", len(keys) == 45, len(keys))
+            check("cross-page name edit survived",
+                  any(k.get("name") == "renamed-p1" for k in keys))
+            check("cross-page account binding survived",
+                  len(keys[44].get("accounts") or []) == 1 if len(keys) > 44 else False)
+
+        print("adding a key")
+        page.get_by_text("+ 添加一个 Key", exact=True).click()
+        page.wait_for_timeout(400)
+        check("add jumps to the last page so the new row is visible",
+              "第 41-46 条 / 共 46 条" in page.locator("#keyList .pager-info").inner_text(),
+              page.locator("#keyList .pager-info").inner_text())
+        check("last page renders the fresh row",
+              page.locator("#keyList input[placeholder='备注名']").count() == 6,
+              page.locator("#keyList input[placeholder='备注名']").count())
+
+        check("no page errors after interacting", not errors, errors[:3])
+        browser.close()
+
+
+def main():
+    with socketserver.TCPServer(("127.0.0.1", 0), Handler) as srv:
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        run_checks("http://127.0.0.1:%d/dashboard.html" % port)
+        srv.shutdown()
+    print("")
+    print("pagination browser tests: %d passed, %d failed" % (PASS, FAIL))
+    raise SystemExit(1 if FAIL else 0)
+
+
+if __name__ == "__main__":
+    main()
