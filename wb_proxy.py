@@ -952,7 +952,16 @@ def models_config_view():
     for realm in ("intl", "cn"):
         try:
             product = read_product_config_models(realm=realm)
-            live = fetch_endpoint_models(realm=realm)
+            # PATCH(wb-hub-model-sync-persist) 池子必须包含「仅上游存在」的模型，
+            # 否则面板隐藏它们之后无法从池里恢复（取消隐藏点了没反应）。
+            # 快照是同步时落盘的全量目录；没有快照（从未同步过）时强制拉一次
+            # 上游原始列表 —— 注意不能复用 _models_cache：那里存的是已经按
+            # hidden/order 过滤后的可见列表，缺的正是被隐藏的模型。
+            snapshot = read_catalog_cache(realm)
+            if snapshot:
+                live = snapshot
+            else:
+                live = fetch_endpoint_models(realm=realm, force=True) or []
             entries = merge_catalog(product + (live or []), realm=realm)
         except Exception:
             entries = merge_catalog([], realm=realm)
@@ -1286,6 +1295,10 @@ def sync_models(realm=None):
         _models_cache[realm] = {"at": 0.0, "data": None}
     product = read_product_config_models(realm=realm)
     endpoint = fetch_endpoint_models(realm=realm, force=True)
+    if not endpoint:
+        # PATCH(wb-hub-model-sync-persist) 实时拉取失败（无可用账号 / 上游异常）时
+        # 回退到上次成功的快照，避免一次失败就把目录池缩小、把已发现模型抖掉。
+        endpoint = read_catalog_cache(realm)
     combined = product
     if endpoint:
         combined = product + endpoint
@@ -1293,6 +1306,11 @@ def sync_models(realm=None):
     env_visible = _wb_patch_pick_env(full, realm)
     cfg = wb_settings.model_config(ACCOUNTS_DIR)
     state = sync_model_config(cfg, realm, env_visible, full)
+    # PATCH(wb-hub-model-sync-persist) 把合并后的完整目录落盘：倍率等元数据
+    # 只有持久化后才会被 /v1/models 与面板模型池读到，同步才算真正生效。
+    # endpoint 为空（既没拉到实时数据也没有旧快照）时不写，防止用好数据换掉坏数据。
+    if endpoint:
+        write_catalog_cache(realm, full)
     with _lock:
         _models_cache[realm] = {"at": 0.0, "data": None}
     return {
@@ -1573,6 +1591,12 @@ def fetch_models(realm=None):
         if c["data"] and time.time() - c["at"] < 300:
             return c["data"]
     live = read_product_config_models(realm=r)
+    # PATCH(wb-hub-model-sync-persist) 同步快照比桌面端缓存文件更新（它来自
+    # 上一次「从上游同步」的实时拉取），放在后面合并 => 倍率等元数据以快照为准。
+    # 没有快照时行为与旧版完全一致。
+    snapshot = read_catalog_cache(r)
+    if snapshot:
+        live = live + snapshot
     if not live and r == "intl":
         # Live upstream list carries per-model metadata (credits/multiplier,...)
         live = fetch_endpoint_models()
@@ -1684,6 +1708,18 @@ def model_entry(mid, meta):
     tags = [t for t in (meta.get("tags") or []) if isinstance(t, str) and not t.startswith("badge:")]
     if tags:
         item["tags"] = tags
+    # PATCH(wb-hub-model-sync-persist) 上游用 "badge:文案:#颜色" tag 标注促销
+    # （如 badge:限时免费:#FF0000 / badge:夜间折扣:#1E90FF）。以前 model_entry
+    # 把 badge: tag 整个丢掉，面板只能按模型 id 硬编码促销，倍率永远对不上上游。
+    # 这里解析成结构化 badges 交给前端渲染。
+    badges = []
+    for t in (meta.get("tags") or []):
+        if isinstance(t, str) and t.startswith("badge:"):
+            parts = t.split(":", 2)
+            if len(parts) == 3 and parts[1].strip():
+                badges.append({"text": parts[1].strip(), "color": (parts[2] or "").strip()})
+    if badges:
+        item["badges"] = badges
     return item
 def read_product_config_models(realm=None):
     """Read the desktop app's cached catalog: [(id, meta), ...]."""
@@ -1697,6 +1733,67 @@ def read_product_config_models(realm=None):
     except Exception as exc:
         return []
     return parse_product_config_models(cfg)
+# PATCH(wb-hub-model-sync-persist) 面板「从上游同步」的结果落盘。
+# 背景：sync_models 每次都会实时拉取上游 models 端点（倍率/能力随上游变动），
+# 但旧实现只把 hidden/order 写进 settings.json， fresh 的目录元数据被丢弃；
+# 而 /v1/models 与 /settings/models 又重新去读桌面端缓存快照
+# （~/.workbuddy/cache/acc-product-config-v3.json，容器里是挂载的旧文件），
+# 于是「同步」按钮看起来没有任何效果——倍率永远是旧快照里的值。
+# 这里把同步时合并出的完整目录（id -> meta）写进 ACCOUNTS_DIR 持久化，
+# 读取方优先用它，同步按钮才真正生效。
+CATALOG_CACHE_FILE = "model_catalog_cache.json"
+
+
+def catalog_cache_path():
+    """Snapshot file lives with the other panel data (survives restarts)."""
+    return os.path.join(ACCOUNTS_DIR, CATALOG_CACHE_FILE)
+
+
+def read_catalog_cache(realm=None):
+    """[(id, meta), ...] persisted by the last successful /models/sync.
+
+    Returns [] when the panel has never synced (or the file is unreadable).
+    """
+    r = realm or CURRENT_REALM
+    try:
+        with open(catalog_cache_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+        entry = (data or {}).get(r) or {}
+        out = []
+        for item in entry.get("models") or []:
+            if isinstance(item, (list, tuple)) and len(item) == 2 and item[0]:
+                meta = item[1] if isinstance(item[1], dict) else {}
+                out.append((str(item[0]), meta))
+        return out
+    except Exception:
+        return []
+
+
+def write_catalog_cache(realm, entries):
+    """Atomically persist the merged catalog for one realm."""
+    r = realm or CURRENT_REALM
+    path = catalog_cache_path()
+    data = {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh) or {}
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    data[r] = {
+        "at": time.time(),
+        "models": [[mid, meta if isinstance(meta, dict) else {}] for mid, meta in entries or []],
+    }
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+        return True
+    except Exception as exc:
+        log("catalog cache write failed: %s" % exc)
+        return False
 # Upstream capability/metadata fields we care to forward from the personal
 # models endpoint so nothing has to be hard-coded locally (notably `credits`,
 # the live per-model multiplier shown on the dashboard).

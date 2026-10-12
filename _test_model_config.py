@@ -206,5 +206,83 @@ finally:
     P.fetch_endpoint_models = original_endpoint_reader
 
 print()
+print("[14] sync persists a catalog snapshot with fresh upstream meta")
+_orig_product = P.read_product_config_models
+_orig_endpoint = P.fetch_endpoint_models
+try:
+    P.read_product_config_models = lambda realm=None: [
+        ("hy3", {"credits": "x0.42", "name": "HY3"}),
+    ]
+    P.fetch_endpoint_models = lambda realm=None, force=False: (
+        [("hy3", {"credits": "x0.10"}), ("glm-4.7", {"credits": "x1.11"})] if force else [])
+    wb_settings.set_model_config(TMP, "cn", [], [])
+    P._models_cache["cn"] = {"at": 0.0, "data": None}
+    state = P.sync_models(realm="cn")
+    snap = dict(P.read_catalog_cache("cn"))
+    check("snapshot written by sync", bool(snap), snap)
+    check("snapshot carries fresh endpoint credits",
+          snap.get("hy3", {}).get("credits") == "x0.10", snap.get("hy3"))
+    check("snapshot includes live-only model", "glm-4.7" in snap, sorted(snap))
+    check("sync still reports discovered ids", "glm-4.7" in (state.get("discovered") or []),
+          state.get("discovered"))
+
+    print()
+    print("[15] /v1/models layers the snapshot over the stale product file")
+    # The desktop cache file is a stale mount; the snapshot is newer and must win.
+    P.fetch_endpoint_models = lambda realm=None, force=False: []
+    P._models_cache["cn"] = {"at": 0.0, "data": None}
+    entries = dict(P.fetch_models(realm="cn"))
+    check("fresh credits reach /v1/models",
+          entries.get("hy3", {}).get("credits") == "x0.10", entries.get("hy3"))
+    check("live-only model reaches /v1/models", "glm-4.7" in entries, sorted(entries))
+
+    print()
+    print("[16] a failed live fetch falls back to the snapshot (no shrink)")
+    P.fetch_endpoint_models = lambda realm=None, force=False: []
+    P._models_cache["cn"] = {"at": 0.0, "data": None}
+    state = P.sync_models(realm="cn")
+    check("fallback keeps live-only model discoverable",
+          "glm-4.7" in (state.get("discovered") or []), state.get("discovered"))
+
+    print()
+    print("[17] panel pool contains hidden live-only models (unhide restore)")
+    wb_settings.set_model_config(TMP, "cn", ["glm-4.7"], ["hy3", "glm-4.7"])
+    config = P.models_config_view()
+    rc = config["realms"]["cn"]
+    pool = {m["id"] for m in rc["pool_models"]}
+    check("hidden live-only model present in pool (snapshot path)",
+          "glm-4.7" in pool, sorted(pool))
+    check("hidden model absent from visible list", "glm-4.7" not in rc["visible"], rc["visible"])
+    # No snapshot yet (fresh deploy): the view must force-fetch the raw upstream
+    # list instead of reusing _models_cache, which only holds visible entries.
+    os.remove(os.path.join(TMP, "model_catalog_cache.json"))
+    P.fetch_endpoint_models = lambda realm=None, force=False: (
+        [("hy3", {"credits": "x0.10"}), ("glm-4.7", {"credits": "x1.11"})] if force
+        else [("hy3", {"credits": "x0.10"})])  # non-force = the filtered cache
+    config = P.models_config_view()
+    rc = config["realms"]["cn"]
+    pool = {m["id"] for m in rc["pool_models"]}
+    check("hidden live-only model present in pool (force-fetch path)",
+          "glm-4.7" in pool, sorted(pool))
+
+    print()
+    print("[18] model_entry forwards upstream badge tags")
+    entry = P.model_entry("hy3", {
+        "credits": "x0.00",
+        "tags": ["craft", "badge:限时免费:#FF0000"],
+    })
+    check("badge tag parsed into structured badges",
+          entry.get("badges") == [{"text": "限时免费", "color": "#FF0000"}], entry.get("badges"))
+    check("non-badge tags still forwarded", entry.get("tags") == ["craft"], entry.get("tags"))
+    entry2 = P.model_entry("glm-5.2", {"credits": "x0.79", "tags": ["badge:夜间折扣:#1E90FF"]})
+    check("night-discount badge parsed",
+          entry2.get("badges") == [{"text": "夜间折扣", "color": "#1E90FF"}], entry2.get("badges"))
+    entry3 = P.model_entry("hy3", {"credits": "x0.00", "tags": ["craft"]})
+    check("no badge tag => no badges field", "badges" not in entry3, entry3.get("badges"))
+finally:
+    P.read_product_config_models = _orig_product
+    P.fetch_endpoint_models = _orig_endpoint
+
+print()
 print("PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

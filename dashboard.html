@@ -893,19 +893,8 @@ function renderAvailableModels(){
     return;
   }
   tb.innerHTML = MODELS_DATA.map(m => {
-    // 1. 倍率与折扣
-    let credBadge = '-';
-    const c = (m.credits || '').toString().toLowerCase().replace('x', '');
-    if(c === '0.00' || c === '0' || m.id === 'hy3' || m.id === 'hy4-preview-f' || (m.id === 'deepseek-v4.1-flash' && window.VIEW_REALM === 'intl')){
-      credBadge = '<span class="badge ok" style="background:rgba(38,187,130,.15);color:#26bb82">限时免费 0.00x</span>';
-    } else if(m.id === 'deepseek-v4.1-flash' && window.VIEW_REALM === 'cn'){
-      credBadge = '<span class="badge" style="background:rgba(255,77,79,.15);color:#ff4d4f;border:1px solid rgba(255,77,79,.3)">独家优惠 0.03x</span>';
-    } else if((m.id === 'glm-5.2' || m.id === 'deepseek-v4-pro') && window.VIEW_REALM === 'cn'){
-      const raw = m.credits ? (m.credits.startsWith('x') ? m.credits.slice(1) + 'x' : m.credits) : '0.79x';
-      credBadge = '<span class="badge s">' + raw + ' <span style="font-size:10px;color:var(--accent)">(夜间0.5x)</span></span>';
-    } else if(m.credits){
-      credBadge = '<span class="badge s">' + esc(m.credits.startsWith('x') ? m.credits.slice(1) + 'x' : m.credits) + '</span>';
-    }
+    // 1. 倍率与折扣（数据驱动：上游 credits + badge tag，见 model-rates-core）
+    const credBadge = modelCreditBadge(m, window.VIEW_REALM);
 
     // 2. 模型能力 (Vision, Tool calls)
     const caps = [];
@@ -1019,9 +1008,11 @@ function unhideModel(id){
   if(wasHidden && !MODELS_DATA.some(m => m.id === id)){
     // The public list omits hidden models, so restore from the server-side
     // full pool captured by loadModels() rather than re-fetching the same
-    // filtered /v1/models response.
-    const restored = getModelFromPool(id);
-    if(restored) MODELS_DATA.push(restored);
+    // filtered /v1/models response. When the model is absent from every
+    // catalog source (e.g. upstream retired it), fall back to a bare entry
+    // so the row still appears instead of the click doing nothing.
+    const restored = getModelFromPool(id) || {id: id};
+    MODELS_DATA.push(restored);
   }
   renderAvailableModels();
 }
@@ -1616,6 +1607,51 @@ function sortRows(list, keyFn, dir){
     .map(function(e){ return e.row; });
 }
 /* pagination-core:end */
+
+/* model-rates-core:begin */
+// 模型倍率列：以上游 credits 为准，促销信息读上游 badge tag。
+// 旧实现按模型 id 硬编码「限时免费 / 独家优惠 / 夜间0.5x」，上游一改价面板
+// 就对不上（例如 deepseek-v4.1-flash 上游已从 0.03x 调到 0.11x，面板仍显示旧值）。
+// 现在：credits 为 0 => 限时免费；有 credits => 显示上游值并附带 badge tag；
+// 两者都没有（纯静态目录、从未同步过）才回落到内置促销兜底。
+function modelCreditBadge(m, realm){
+  m = m || {};
+  var raw = (m.credits === undefined || m.credits === null) ? '' : String(m.credits).trim();
+  var num = parseFloat(raw.replace(/^x/i, '').replace(/[^0-9.]/g, ''));
+  var isFree = raw !== '' && !isNaN(num) && num === 0;
+  var promo = '';
+  var badges = m.badges || [];
+  for(var i = 0; i < badges.length; i++){
+    var b = badges[i] || {};
+    // 免费模型的促销文案通常就是「限时免费 / 夜间免费」，与下面的绿色徽章重复，跳过
+    if(isFree && String(b.text || '').indexOf('免费') >= 0) continue;
+    var col = /^#[0-9a-fA-F]{6}$/.test(b.color || '') ? b.color : '#1E90FF';
+    promo += '<span class="badge" style="font-size:11px;margin-left:4px;background:' + col
+      + '1a;color:' + col + ';border:1px solid ' + col + '59">' + esc(b.text || '') + '</span>';
+  }
+  var freeBadge = '<span class="badge ok" style="background:rgba(38,187,130,.15);color:#26bb82">限时免费 0.00x</span>';
+  if(isFree){
+    return freeBadge + promo;
+  }
+  if(raw){
+    var shown = raw.replace(/^x/i, '').replace(/\s*credits?\s*$/i, '');
+    if(!/x$/i.test(shown)) shown += 'x';
+    return '<span class="badge s">' + esc(shown) + '</span>' + promo;
+  }
+  // ---- 无上游数据时的内置兜底（与旧版一致，防止纯静态目录部署回归）----
+  if(m.id === 'hy3' || m.id === 'hy4-preview-f'
+     || (m.id === 'deepseek-v4.1-flash' && realm === 'intl')){
+    return freeBadge;
+  }
+  if(m.id === 'deepseek-v4.1-flash' && realm === 'cn'){
+    return '<span class="badge" style="background:rgba(255,77,79,.15);color:#ff4d4f;border:1px solid rgba(255,77,79,.3)">独家优惠 0.03x</span>';
+  }
+  if((m.id === 'glm-5.2' || m.id === 'deepseek-v4-pro') && realm === 'cn'){
+    return '<span class="badge s">0.79x <span style="font-size:10px;color:var(--accent)">(夜间0.5x)</span></span>';
+  }
+  return '-';
+}
+/* model-rates-core:end */
 
 var PAGE_STORE = 'wb-proxy-page';
 var PAGE_STATE = {
