@@ -276,7 +276,7 @@ a:hover{text-decoration:underline}
   <!-- 版本中枢控制栏 -->
   <div class="realm-banner">
     <div>
-      <div style="font-size:11px;color:var(--dim);margin-bottom:6px;font-weight:600;text-transform:uppercase;letter-spacing:.5px">查看详情 (点击切换视图)</div>
+      <div style="font-size:11px;color:var(--dim);margin-bottom:6px;font-weight:600;text-transform:uppercase;letter-spacing:.5px">管理视图 (点击切换区域)</div>
       <div class="realm-tabs">
         <div id="tabIntl" class="realm-tab active" onclick="switchViewRealm('intl')">
           
@@ -297,10 +297,10 @@ a:hover{text-decoration:underline}
     <div class="realm-banner-right" style="background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 16px">
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
         <span id="gatewayDot" class="dot"></span>
-        <span style="font-size:13px">网关当前上游: <b id="activeGatewayName" style="color:var(--accent)">国际版</b></span>
+        <span style="font-size:13px">API 请求路由: <b id="activeGatewayName" style="color:var(--accent)">按账号和模型自动选择</b></span>
       </div>
-      <div style="font-size:11px;color:var(--dim);margin-bottom:8px">出站地址: <span id="activeEndpoint" class="mono" style="color:var(--fg)">https://www.workbuddy.ai/v2</span> (本地已保存)</div>
-      <button class="toggle-realm-btn" id="btnToggleRealm" onclick="toggleActiveGatewayRealm()" style="cursor:pointer;width:100%">切换网关上游为【国内版】</button>
+      <div style="font-size:11px;color:var(--dim);margin-bottom:8px">客户端无需切换出口，网关会根据 WorkBuddy 账号凭证和模型自动选择上游</div>
+      <button class="toggle-realm-btn" id="btnToggleRealm" onclick="toggleActiveGatewayRealm()" style="cursor:pointer;width:100%">切换管理视图为【国内版】</button>
     </div>
   </div>
   <!-- 后台定时调度器状态栏 -->
@@ -514,10 +514,9 @@ a:hover{text-decoration:underline}
     </section>
 
     <section>
-      <h2>API Key 与出口绑定 <em id="setKeyState"></em></h2>
+      <h2>API Key 与路由策略 <em id="setKeyState"></em></h2>
       <div style="font-size:12px;color:var(--dim);margin-bottom:14px">
-        可以配置多个 Key，并给每个 Key 指定一个上游出口。绑定后，用该 Key 发起的请求会固定走对应出口，
-        两个出口可同时对外服务，无需再切换全局网关。
+        可以配置多个 Key。默认“自动路由”会按请求模型和可用账号选择国内或国际上游，也可以把某个 Key 固定到单一区域。
       </div>
       <div id="keyList"></div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
@@ -791,18 +790,17 @@ function updateUI(){
   if(tIntl) tIntl.className = "realm-tab" + (isIntlView ? " active" : "");
   if(tCn) tCn.className = "realm-tab" + (!isIntlView ? " active" : "");
 
-  const isIntlGw = (window.ACTIVE_GATEWAY_REALM === "intl");
   const gwName = document.getElementById("activeGatewayName");
   if(gwName) {
-    gwName.textContent = isIntlGw ? "国际版" : "国内版";
-    gwName.style.color = isIntlGw ? "var(--accent)" : "var(--warn)";
+    gwName.textContent = "按账号和模型自动选择";
+    gwName.style.color = "var(--accent)";
   }
   const ep = document.getElementById("activeEndpoint");
-  if(ep) ep.textContent = isIntlGw ? "https://www.workbuddy.ai/v2" : "https://copilot.tencent.com/v2";
+  if(ep) ep.textContent = "按账号 realm 选择 WorkBuddy 上游地址";
 
   const btnToggle = document.getElementById("btnToggleRealm");
   if(btnToggle) {
-    btnToggle.textContent = isIntlGw ? "切换网关上游为【国内版】" : "切换网关上游为【国际版】";
+    btnToggle.textContent = isIntlView ? "切换管理视图为【国内版】" : "切换管理视图为【国际版】";
   }
 
   const btnCheckin = document.getElementById("btnCheckin");
@@ -825,19 +823,9 @@ async function switchViewRealm(r){
 };
 
 async function toggleActiveGatewayRealm(){
-  const next = (window.ACTIVE_GATEWAY_REALM === "intl" ? "cn" : "intl");
-  try {
-    const res = await postJSON("/realm", {realm: next});
-    window.ACTIVE_GATEWAY_REALM = res.current || next;
-    toast("网关默认上游已切换并永久保存为: " + (window.ACTIVE_GATEWAY_REALM === "intl" ? "国际版" : "国内版"));
-    window.VIEW_REALM = window.ACTIVE_GATEWAY_REALM;
-    window.updateUI();
-    await loadAccounts();
-    await loadModels();
-    await refresh();
-  }catch(e){
-    alert("切换失败: " + e.message);
-  }
+  const next = (window.VIEW_REALM === "intl" ? "cn" : "intl");
+  await switchViewRealm(next);
+  toast("已切换管理视图为: " + (next === "intl" ? "国际版" : "国内版"));
 };
 
 async function initRealm(){
@@ -2692,10 +2680,10 @@ async function loadSettings(showToast){
           ? ('当前仅使用启动参数中的 Key: ' + (data.api_key_masked || '') + '（保存后将改由面板管理）')
           : '当前未设置 API Key，/v1 接口不校验密钥。';
       } else if(!bound.length){
-        keyHint.textContent = '目前没有 Key 绑定出口，所有请求跟随「网关与运维」页的全局切换。';
+        keyHint.textContent = '目前没有 Key 固定出口，所有请求按账号和模型自动路由。';
       } else {
         keyHint.textContent = bound.map(k =>
-          (k.name || '未命名') + ' → ' + (k.realm === 'cn' ? '国内版' : '国际版')
+          (k.name || '未命名') + ' → ' + (k.realm === 'auto' ? '自动路由' : (k.realm === 'cn' ? '国内版' : '国际版'))
         ).join(' · ');
       }
     }
@@ -2709,7 +2697,7 @@ async function loadSettings(showToast){
       // leaving the field untouched will not wipe an existing key.
       stored_key: '',
       masked: k.masked || '',
-      realm: k.realm || '',
+      realm: k.realm || 'auto',
       enabled: k.enabled !== false,
       accounts: k.accounts || [],
     }));
@@ -2768,7 +2756,7 @@ function randomKeyValue(){
 }
 
 const REALM_CHOICES = [
-  ['', '跟随面板切换'],
+  ['auto', '自动路由（按账号和模型）'],
   ['intl', '固定国际版出口'],
   ['cn', '固定国内版出口'],
 ];
@@ -3028,7 +3016,7 @@ async function writeClipboard(text){
 }
 
 function addApiKeyRow(){
-  API_KEY_ROWS.push({id: '', name: '', key: '', realm: '', enabled: true, masked: ''});
+  API_KEY_ROWS.push({id: '', name: '', key: '', realm: 'auto', enabled: true, masked: ''});
   // Land on the last page so the new row is actually visible; applyView()
   // clamps this deliberate over-shoot down to the real final page.
   PAGE_STATE.keys.page = API_KEY_ROWS.length;
