@@ -57,6 +57,13 @@ if [[ "${SKIP_TESTS:-0}" != "1" ]]; then
   (
     cd "$ROOT_DIR"
     "$VENV_DIR/bin/python" _test_custom_tools.py
+    "$VENV_DIR/bin/python" _test_realm_detection.py
+    "$VENV_DIR/bin/python" _test_model_registry.py
+    "$VENV_DIR/bin/python" _test_route_planner.py
+    "$VENV_DIR/bin/python" _test_api_key_realm.py
+    "$VENV_DIR/bin/python" _test_unified_routing.py
+    "$VENV_DIR/bin/python" _test_models_endpoint.py
+    "$VENV_DIR/bin/python" _test_route_usage.py
     "$VENV_DIR/bin/python" _test_model_cooldown.py
     "$VENV_DIR/bin/python" _test_model_config.py
     "$VENV_DIR/bin/python" _test_usage_key.py
