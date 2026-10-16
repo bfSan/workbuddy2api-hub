@@ -143,7 +143,13 @@ def ensure_launcher_key(accounts_dir):
 # Each key can be bound to one upstream realm, so several clients can hit
 # different exits at the same time instead of sharing the global switch.
 
-REALMS = ("", "intl", "cn")
+REALMS = ("auto", "intl", "cn")
+
+
+def normalize_key_realm(value):
+    """Return the supported Key routing policy."""
+    realm = str(value or "").strip().lower()
+    return realm if realm in REALMS else "auto"
 
 
 def _clean_key_entry(entry):
@@ -153,9 +159,7 @@ def _clean_key_entry(entry):
     key = str(entry.get("key") or "").strip()
     if not key:
         return None
-    realm = str(entry.get("realm") or "").strip().lower()
-    if realm not in REALMS:
-        realm = ""
+    realm = normalize_key_realm(entry.get("realm"))
     # PATCH(wb-hub-key-accounts) 这个函数的返回字典是硬编码的白名单，
     # 不在这里放行的话 accounts 会被静默丢掉（面板看着存进去了，重启就没了）。
     accounts = entry.get("accounts")
@@ -197,9 +201,9 @@ def api_keys(accounts_dir):
         if legacy:
             return [{
                 "id": "legacy",
-                "name": "默认（跟随面板切换）",
+                "name": "默认（自动路由）",
                 "key": legacy,
-                "realm": "",
+                "realm": "auto",
                 "enabled": True,
             }]
     return []
@@ -246,7 +250,7 @@ def match_api_key(accounts_dir, supplied, extra_keys=()):
                 "id": "launcher",
                 "name": "启动参数",
                 "key": candidate,
-                "realm": "",
+                "realm": "auto",
                 "enabled": True,
                 "source": "launcher",
             }
