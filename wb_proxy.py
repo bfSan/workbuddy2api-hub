@@ -3479,7 +3479,7 @@ class Handler(BaseHTTPRequestHandler):
         return False
     def _key_realm(self):
         """Realm bound to the key this request used, or "" when unbound."""
-        return (self.key_entry or {}).get("realm") or ""
+        return wb_settings.normalize_key_realm((self.key_entry or {}).get("realm"))
     def _cross_realm_error(self, model, realm):
         """Explain a model/exit mismatch instead of letting upstream reject it.
         Sending gpt-6-astra to the domestic exit (or deepseek-v4-pro to the
@@ -3504,16 +3504,17 @@ class Handler(BaseHTTPRequestHandler):
         global switch. Returning None lets open_upstream() fall back to
         model-based detection.
         """
-        if explicit:
+        if explicit in ("intl", "cn"):
             return explicit
         bound = self._key_realm()
-        if bound:
+        if bound in ("intl", "cn"):
             return bound
         header = self.headers.get("X-Realm")
-        if header:
+        if header in ("intl", "cn"):
             return header
         try:
-            return parse_qs(urlparse(self.path).query).get("realm", [None])[0]
+            query_realm = parse_qs(urlparse(self.path).query).get("realm", [None])[0]
+            return query_realm if query_realm in ("intl", "cn") else None
         except Exception:
             return None
     def _authorized(self):
