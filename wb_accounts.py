@@ -116,6 +116,44 @@ def jwt_uid(token):
 def jwt_issuer(token):
     return str(_jwt_claims(token).get("iss") or "")
 
+
+def detect_account_realm(token, domain="", stored_realm=""):
+    """Classify a WorkBuddy credential without guessing a host.
+
+    The issuer and credential domain are independent pieces of evidence.  A
+    conflict is quarantined as unknown; a stored realm is used only as a
+    backward-compatible fallback when neither piece of evidence is present.
+    """
+    issuer = jwt_issuer(token).strip().lower()
+    dom = str(domain or "").strip().lower()
+
+    def classify(value):
+        if not value:
+            return ""
+        if any(marker in value for marker in ("copilot.tencent.com", "codebuddy.cn")):
+            return "cn"
+        if "workbuddy.ai" in value:
+            return "intl"
+        return ""
+
+    issuer_realm = classify(issuer)
+    domain_realm = classify(dom)
+    if issuer_realm and domain_realm and issuer_realm != domain_realm:
+        return "unknown", "conflict", (
+            "credential issuer points to %s but domain points to %s"
+            % (issuer_realm, domain_realm)
+        )
+    if issuer_realm and domain_realm:
+        return issuer_realm, "issuer+domain", ""
+    if issuer_realm:
+        return issuer_realm, "issuer", ""
+    if domain_realm:
+        return domain_realm, "domain", ""
+    stored = str(stored_realm or "").strip().lower()
+    if stored in ("intl", "cn"):
+        return stored, "stored", ""
+    return "unknown", "none", "cannot determine account realm from issuer or domain"
+
 def normalize_epoch(value):
     try:
         number = float(value)
@@ -126,11 +164,7 @@ def normalize_epoch(value):
     return int(number)
 
 def detect_realm_from_token(token, domain=None):
-    iss = jwt_issuer(token).lower()
-    dom = str(domain or "").lower()
-    if "copilot.tencent.com" in dom or "codebuddy.cn" in dom or "copilot.tencent.com" in iss or "codebuddy.cn" in iss:
-        return "cn"
-    return "intl"
+    return detect_account_realm(token, domain)[0]
 
 class Account(object):
     def __init__(self, data, path=None):
@@ -140,8 +174,11 @@ class Account(object):
         self.uid = str(data.get("uid") or jwt_uid(token))
         self.nickname = str(data.get("nickname") or "")
         self.domain = str(data.get("domain") or "")
-        self.realm = str(data.get("realm") or detect_realm_from_token(token, self.domain))
-        if not self.domain:
+        stored_realm = str(data.get("realm") or "").strip().lower()
+        self.realm, self.realm_source, self.realm_error = detect_account_realm(
+            token, self.domain, stored_realm
+        )
+        if not self.domain and self.realm in ("intl", "cn"):
             self.domain = get_realm_config(self.realm)["domain"]
         self.platform = str(data.get("platform") or "CLI")
         self.enterprise_id = str(data.get("enterpriseId") or "")
@@ -175,6 +212,8 @@ class Account(object):
             "nickname": self.nickname,
             "domain": self.domain,
             "realm": self.realm,
+            "realmSource": self.realm_source,
+            "realmError": self.realm_error,
             "platform": self.platform,
             "enterpriseId": self.enterprise_id,
             "accessToken": self.access_token,
@@ -197,6 +236,8 @@ class Account(object):
             "nickname": self.nickname or (self.uid[:8] if self.uid else "?"),
             "domain": self.domain,
             "realm": self.realm,
+            "realmSource": self.realm_source,
+            "realmError": self.realm_error,
             "platform": self.platform,
             "enterpriseId": self.enterprise_id,
             "enabled": bool(self.enabled),
@@ -1010,9 +1051,19 @@ def normalise_import_row(row, realm=None):
     if token.count(".") != 2:
         raise ValueError("accessToken is not a JWT")
 
-    detected = str(realm or pick("realm") or "").strip().lower()
-    if detected not in ("intl", "cn"):
-        detected = detect_realm_from_token(token, pick("domain"))
+    supplied_domain = pick("domain")
+    detected, _source, detection_error = detect_account_realm(
+        token, supplied_domain, pick("realm")
+    )
+    forced = str(realm or "").strip().lower()
+    if forced:
+        if forced not in ("intl", "cn"):
+            raise ValueError("realm must be intl or cn")
+        if detected in ("intl", "cn") and detected != forced:
+            raise ValueError("realm conflicts with credential evidence")
+        detected = forced
+    elif detected == "unknown":
+        raise ValueError("cannot determine account realm: %s" % detection_error)
     cfg = get_realm_config(detected)
 
     raw_uid = str(pick("uid") or "").strip() or jwt_uid(token)
@@ -1023,7 +1074,7 @@ def normalise_import_row(row, realm=None):
     return {
         "uid": uid,
         "nickname": str(pick("nickname") or ""),
-        "domain": str(pick("domain") or cfg["domain"]),
+        "domain": str(supplied_domain or cfg["domain"]),
         "realm": detected,
         "platform": str(pick("platform") or "CLI"),
         "enterpriseId": str(pick("enterpriseId") or ""),
