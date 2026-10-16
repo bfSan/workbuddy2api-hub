@@ -375,7 +375,7 @@ _perf_lock = threading.Lock()
 def perf_stats(sample=5000, realm=None, ttl=10):
     """Cached wrapper: parsing thousands of rows is CPU-heavy, and the
     dashboard polls this endpoint every few seconds."""
-    r = realm or CURRENT_REALM
+    r = realm if realm in ("intl", "cn") else None
     try:
         key = (int(sample), r)
     except Exception:
@@ -486,7 +486,7 @@ def account_display_name(uid, nickname=None, alias=None):
 
 def usage_snapshot(realm=None, ttl=10):
     """Cached wrapper: the dashboard polls this every few seconds."""
-    r = realm or CURRENT_REALM
+    r = realm if realm in ("intl", "cn") else None
     now = time.time()
     with _snap_lock:
         hit = _snap_cache.get(r)
@@ -499,7 +499,7 @@ def usage_snapshot(realm=None, ttl=10):
 
 
 def _usage_snapshot_uncached(realm=None):
-    r = realm or CURRENT_REALM
+    r = realm if realm in ("intl", "cn") else None
     rep = POOL.representative(realm=r) if POOL else current_account()
     snap = _empty_stats()
     snap["started"] = _usage.get("started", time.time())
@@ -538,7 +538,7 @@ def _usage_snapshot_uncached(realm=None):
         log(f"usage snapshot read failed: {exc}")
     snap["since"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(snap.get("started", time.time())))
     snap["log_file"] = USAGE_LOG
-    snap["realm"] = r
+    snap["realm"] = r or "auto"
     aliases = wb_patch_account_aliases()
     snap["accounts_map"] = {
         a.uid: {
@@ -721,6 +721,16 @@ def account_views(realm=None):
     for view in views:
         view["alias"] = aliases.get(view.get("uid") or "") or ""
     return views
+
+
+def normalize_panel_key_realm(value):
+    """The merged management panel only creates automatic-routing Keys.
+
+    The API and settings modules continue to understand legacy hard realm
+    policies for compatibility, but the new panel deliberately cannot create
+    a Key that requires a manual domestic/international choice.
+    """
+    return "auto"
 _byacct_cache = {"at": 0.0, "data": None}
 _byacct_lock = threading.Lock()
 
@@ -922,7 +932,10 @@ def runtime_settings_view():
         keys.append({
             "id": entry.get("id") or "",
             "name": entry.get("name") or "",
-            "realm": wb_settings.normalize_key_realm(entry.get("realm")),
+            # The merged panel no longer exposes a fixed-exit editor.  Keep
+            # the stored hard policy usable by old clients, but present it as
+            # automatic routing until the user explicitly saves the row again.
+            "realm": normalize_panel_key_realm(entry.get("realm")),
             "enabled": entry.get("enabled", True) is not False,
             # PATCH(wb-hub-key-accounts) 面板要拿已勾选的账号来回显
             "accounts": entry.get("accounts") or [],
@@ -1308,11 +1321,11 @@ def sync_model_config(cfg, realm, filtered_entries, full_entries):
     }
 
 
-def sync_models(realm=None):
-    """Force-refresh the upstream catalog and persist panel visibility choices."""
-    realm = (realm or CURRENT_REALM)
+def _sync_models_one(realm):
+    """Refresh and persist one realm's catalog."""
+    realm = str(realm or "").strip().lower()
     if realm not in ("intl", "cn"):
-        realm = CURRENT_REALM
+        raise ValueError("realm must be intl or cn")
     # The public list must bypass the normal 300s cache: otherwise pressing
     # "sync" repeatedly reports the same stale state.
     with _lock:
@@ -1347,6 +1360,32 @@ def sync_models(realm=None):
         "order": state["order"],
         "hidden_count": state["hidden_count"],
         "saved": state["saved"],
+    }
+
+
+def sync_models(realm=None):
+    """Refresh model catalogs.
+
+    Explicit ``intl``/``cn`` keeps the legacy management API intact.  An
+    omitted/``all`` realm refreshes both catalogs so the merged panel never
+    requires a manual region switch.
+    """
+    requested = str(realm or "").strip().lower()
+    if requested in ("intl", "cn"):
+        return _sync_models_one(requested)
+    if requested not in ("", "all", "auto"):
+        raise ValueError("realm must be intl, cn, all or empty")
+    results = [_sync_models_one(r) for r in ("intl", "cn")]
+    discovered = []
+    for result in results:
+        discovered.extend(result.get("discovered") or [])
+    return {
+        "ok": True,
+        "realm": "auto",
+        "realms": results,
+        "discovered": discovered,
+        "endpoint_count": sum(int(result.get("endpoint_count") or 0) for result in results),
+        "hidden_count": sum(int(result.get("hidden_count") or 0) for result in results),
     }
 
 def _wb_patch_pick_env(entries, r):
@@ -3732,7 +3771,14 @@ class Handler(BaseHTTPRequestHandler):
             # 这样 Codex++ 之类只认 base_url 的客户端也能自动补全下拉列表。
             if os.environ.get("WB_PUBLIC_MODELS", "1") != "1" and not self._authorized():
                 return
-            req_realm = self._request_realm()
+            # Model discovery is intentionally a union.  A legacy explicit
+            # query/header filter is still honored, but the active panel view
+            # and a hard API-key policy do not hide the other catalog.
+            req_realm = query.get('realm', [None])[0]
+            if req_realm not in ("intl", "cn"):
+                req_realm = self.headers.get('X-Realm')
+            if req_realm not in ("intl", "cn"):
+                req_realm = None
             try:
                 result = models_response(req_realm)
             except Exception as exc:
@@ -3741,7 +3787,9 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/usage", "/v1/usage"):
             if not self._authorized():
                 return
-            req_realm = query.get('realm', [None])[0] or self.headers.get('X-Realm') or CURRENT_REALM
+            req_realm = query.get('realm', [None])[0] or self.headers.get('X-Realm')
+            if req_realm not in ("intl", "cn"):
+                req_realm = None
             return self._json(200, usage_snapshot(realm=req_realm))
         if path == "/usage/by-key":
             if not self._authorized():
@@ -3754,7 +3802,9 @@ class Handler(BaseHTTPRequestHandler):
                 limit = max(1, min(1000, int((query.get("limit") or ["100"])[0])))
             except ValueError:
                 limit = 100
-            req_realm = query.get('realm', [None])[0] or self.headers.get('X-Realm') or CURRENT_REALM
+            req_realm = query.get('realm', [None])[0] or self.headers.get('X-Realm')
+            if req_realm not in ("intl", "cn"):
+                req_realm = None
             return self._json(200, recent_usage(limit, realm=req_realm))
         if path == "/accounts/credits":
             if not self._authorized():
@@ -3767,7 +3817,9 @@ class Handler(BaseHTTPRequestHandler):
             if not self._authorized():
                 return
             return self._json(200, {
-                "accounts": account_views(realm=query.get('realm', [None])[0] or CURRENT_REALM),
+                "accounts": account_views(realm=(query.get('realm', [None])[0]
+                                                 if query.get('realm', [None])[0] in ("intl", "cn")
+                                                 else None)),
                 "storage": ACCOUNTS_DIR,
                 "usable": POOL.count_ready() if POOL else 0,
             })
@@ -3828,7 +3880,9 @@ class Handler(BaseHTTPRequestHandler):
                 sample = max(10, min(20000, int((query.get("sample") or ["5000"])[0])))
             except ValueError:
                 sample = 5000
-            req_realm = query.get('realm', [None])[0] or self.headers.get('X-Realm') or CURRENT_REALM
+            req_realm = query.get('realm', [None])[0] or self.headers.get('X-Realm')
+            if req_realm not in ("intl", "cn"):
+                req_realm = None
             return self._json(200, perf_stats(sample, realm=req_realm))
         if path == "/tasks":
             if not self._authorized():
@@ -3995,10 +4049,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not value:
                     return self._error(400, "a key entry is empty - fill it in or remove the row",
                                        "invalid_request_error")
-                realm = str(item.get("realm") or "").strip().lower()
-                if realm not in ("", "intl", "cn"):
-                    return self._error(400, "realm must be intl, cn or empty",
-                                       "invalid_request_error")
+                realm = normalize_panel_key_realm(item.get("realm"))
                 # PATCH(wb-hub-key-accounts) 面板勾选的账号白名单，空 = 不限
                 accounts = item.get("accounts")
                 if isinstance(accounts, (list, tuple)):
@@ -4466,7 +4517,7 @@ class Handler(BaseHTTPRequestHandler):
             payload = self._payload_or_error()
             if payload is None:
                 return
-            realm = str(payload.get("realm") or CURRENT_REALM).strip().lower()
+            realm = str(payload.get("realm") or "").strip().lower()
             try:
                 return self._json(200, sync_models(realm=realm))
             except Exception as exc:

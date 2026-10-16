@@ -273,26 +273,12 @@ a:hover{text-decoration:underline}
 </div>
 <main>
   <div id="pageGateway">
-  <!-- 版本中枢控制栏 -->
+  <!-- 统一账号池与自动路由状态栏 -->
   <div class="realm-banner">
     <div>
-      <div style="font-size:11px;color:var(--dim);margin-bottom:6px;font-weight:600;text-transform:uppercase;letter-spacing:.5px">管理视图 (点击切换区域)</div>
-      <div class="realm-tabs">
-        <div id="tabIntl" class="realm-tab active" onclick="switchViewRealm('intl')">
-          
-          <div class="tab-text">
-            <span class="tab-title">国际版详情 (Global)</span>
-            <span class="tab-desc">www.workbuddy.ai</span>
-          </div>
-        </div>
-        <div id="tabCn" class="realm-tab" onclick="switchViewRealm('cn')">
-          
-          <div class="tab-text">
-            <span class="tab-title">国内版详情 (China)</span>
-            <span class="tab-desc">copilot.tencent.com</span>
-          </div>
-        </div>
-      </div>
+      <div style="font-size:11px;color:var(--dim);margin-bottom:6px;font-weight:600;text-transform:uppercase;letter-spacing:.5px">统一管理视图</div>
+      <div style="font-size:16px;font-weight:700">国内版 + 国际版账号池</div>
+      <div style="font-size:12px;color:var(--dim);margin-top:5px">账号、模型、请求与统计均合并展示，行内标记所属版本</div>
     </div>
     <div class="realm-banner-right" style="background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 16px">
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
@@ -300,7 +286,7 @@ a:hover{text-decoration:underline}
         <span style="font-size:13px">API 请求路由: <b id="activeGatewayName" style="color:var(--accent)">按账号和模型自动选择</b></span>
       </div>
       <div style="font-size:11px;color:var(--dim);margin-bottom:8px">客户端无需切换出口，网关会根据 WorkBuddy 账号凭证和模型自动选择上游</div>
-      <button class="toggle-realm-btn" id="btnToggleRealm" onclick="toggleActiveGatewayRealm()" style="cursor:pointer;width:100%">切换管理视图为【国内版】</button>
+      <div style="font-size:11px;color:var(--accent2);font-weight:600">无需手工切换出口</div>
     </div>
   </div>
   <!-- 后台定时调度器状态栏 -->
@@ -350,13 +336,14 @@ a:hover{text-decoration:underline}
         <button class="primary mini" id="btnModelSave" style="display:none" onclick="saveModelConfig(this)">保存</button>
       </div>
     </div>
-    <div style="font-size:12px;color:var(--dim);margin-bottom:10px">展示当前视图下官方对话大模型、上下文容量、推理/视觉能力及在售倍率</div>
+    <div style="font-size:12px;color:var(--dim);margin-bottom:10px">展示国内版与国际版模型并集、区域变体、上下文容量、推理/视觉能力及在售倍率</div>
     <div id="hiddenModelsBar" style="display:none;margin-bottom:10px;padding:8px 12px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;font-size:12px"></div>
     <div style="overflow-x:auto">
       <table id="modelsTable">
         <thead>
           <tr>
             <th>模型 ID</th>
+            <th>所属版本</th>
             <th>消费倍率 / 优惠</th>
             <th>模型能力</th>
             <th>上下文窗口</th>
@@ -417,7 +404,7 @@ a:hover{text-decoration:underline}
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:12px">
       <div>
         <h2 style="margin:0;font-size:16px;color:var(--fg)">最近请求</h2>
-        <div style="font-size:12px;color:var(--dim);margin-top:4px">展示当前出口最近 200 条请求，包含失败与性能明细</div>
+        <div style="font-size:12px;color:var(--dim);margin-top:4px">展示国内版与国际版合并后的最近 200 条请求，包含失败与性能明细</div>
       </div>
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         <button class="sec mini" id="btnRecentFailOnly" onclick="toggleRecentFailOnly()">仅看失败</button>
@@ -516,7 +503,7 @@ a:hover{text-decoration:underline}
     <section>
       <h2>API Key 与路由策略 <em id="setKeyState"></em></h2>
       <div style="font-size:12px;color:var(--dim);margin-bottom:14px">
-        可以配置多个 Key。默认“自动路由”会按请求模型和可用账号选择国内或国际上游，也可以把某个 Key 固定到单一区域。
+        可以配置多个 Key。所有新保存的 Key 都使用“自动路由”，网关会按请求模型和可用账号自动选择国内或国际上游。
       </div>
       <div id="keyList"></div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
@@ -700,11 +687,9 @@ function closeLogin(){
 
 function openLoginModal(){
   openLogin();
-  const isCn = (window.VIEW_REALM === "cn");
   const rCn = document.getElementById("radioCn");
   const rIntl = document.getElementById("radioIntl");
-  if(rCn) rCn.checked = isCn;
-  if(rIntl) rIntl.checked = !isCn;
+  if(rCn && rIntl && !rCn.checked && !rIntl.checked) rIntl.checked = true;
   triggerLoginForSelectedRealm();
 }
 
@@ -718,7 +703,7 @@ function restartLogin(){
 
 async function triggerLoginForSelectedRealm(){
   const checkedRadio = document.querySelector('input[name="loginRealm"]:checked');
-  const realm = checkedRadio ? checkedRadio.value : (window.VIEW_REALM || "intl");
+  const realm = checkedRadio ? checkedRadio.value : "intl";
   const isCn = (realm === "cn");
 
   if(loginTimer){ clearInterval(loginTimer); loginTimer = null; }
@@ -777,19 +762,13 @@ async function pollLogin(){
 }
 
 
-window.ACTIVE_GATEWAY_REALM = "intl";
-window.VIEW_REALM = "intl";
+window.ACTIVE_GATEWAY_REALM = "auto";
+window.VIEW_REALM = "all";
 window.REALM_FILTER = "all";
 window.MODELS_DATA = [];
 window.ACCOUNTS = [];
 
 function updateUI(){
-  const isIntlView = (window.VIEW_REALM === "intl");
-  const tIntl = document.getElementById("tabIntl");
-  const tCn = document.getElementById("tabCn");
-  if(tIntl) tIntl.className = "realm-tab" + (isIntlView ? " active" : "");
-  if(tCn) tCn.className = "realm-tab" + (!isIntlView ? " active" : "");
-
   const gwName = document.getElementById("activeGatewayName");
   if(gwName) {
     gwName.textContent = "按账号和模型自动选择";
@@ -798,63 +777,34 @@ function updateUI(){
   const ep = document.getElementById("activeEndpoint");
   if(ep) ep.textContent = "按账号 realm 选择 WorkBuddy 上游地址";
 
-  const btnToggle = document.getElementById("btnToggleRealm");
-  if(btnToggle) {
-    btnToggle.textContent = isIntlView ? "切换管理视图为【国内版】" : "切换管理视图为【国际版】";
-  }
-
   const btnCheckin = document.getElementById("btnCheckin");
-  if(btnCheckin) btnCheckin.style.display = (window.VIEW_REALM === "cn" ? "inline-block" : "none");
-};
-
-async function switchViewRealm(r){
-  if(window.VIEW_REALM === r) return;
-  window.VIEW_REALM = r;
-  // Another realm is a different row set, so land on page 1 rather than
-  // whatever page the previous realm happened to leave open.
-  PAGE_STATE.accounts.page = 1;
-  window.updateUI();
-  await loadAccounts();
-  await loadModels();
-  await loadGrowthTasks();
-  await loadSchedulerStatus();
-  await loadAnalytics();
-  await refresh();
-};
-
-async function toggleActiveGatewayRealm(){
-  const next = (window.VIEW_REALM === "intl" ? "cn" : "intl");
-  try {
-    // Persist only the management view. API traffic is still routed by the
-    // account/model planner and never reads this state.
-    await postJSON("/realm", {realm: next});
-    await switchViewRealm(next);
-    toast("已切换管理视图为: " + (next === "intl" ? "国际版" : "国内版"));
-  } catch(e) {
-    alert("切换管理视图失败: " + e.message);
-  }
+  if(btnCheckin) btnCheckin.style.display = "inline-block";
 };
 
 async function initRealm(){
-  try {
-    const r = await getJSON("/realm");
-    if(r && r.current) window.ACTIVE_GATEWAY_REALM = r.current;
-  } catch(e){}
-  window.VIEW_REALM = window.ACTIVE_GATEWAY_REALM;
+  // Kept as a compatibility hook for older embedded dashboard callers. The
+  // management data plane is always merged and never follows CURRENT_REALM.
+  window.ACTIVE_GATEWAY_REALM = "auto";
+  window.VIEW_REALM = "all";
   window.updateUI();
 }
 
 async function loadModels(){
   try{
-    const r = await getJSON('/v1/models?realm=' + encodeURIComponent(window.VIEW_REALM));
+    const r = await getJSON('/v1/models');
     MODELS_DATA = r.data || [];
     // 拉取面板配置，用于「已隐藏 / 恢复」条与编辑态
     try{
       const cfg = await getJSON('/settings/models');
-      const rc = (cfg.realms || {})[window.VIEW_REALM] || {};
-      MODEL_POOL = rc.pool || [];
-      MODEL_POOL_DATA = rc.pool_models || [];
-      MODEL_CONFIG = { hidden: rc.hidden || [], order: rc.order || [] };
+      const unified = cfg.unified || {};
+      const realms = cfg.realms || {};
+      MODEL_POOL = unified.visible || MODELS_DATA.map(m => m.id);
+      MODEL_POOL_DATA = unified.models || MODELS_DATA.slice();
+      const hidden = Array.from(new Set([].concat(
+        (realms.intl || {}).hidden || [], (realms.cn || {}).hidden || []
+      )));
+      const order = (realms.intl || {}).order || (realms.cn || {}).order || [];
+      MODEL_CONFIG = { hidden: hidden, order: order };
     }catch(e){ MODEL_POOL = MODELS_DATA.map(m => m.id); MODEL_POOL_DATA = MODELS_DATA.slice(); }
     renderAvailableModels();
   }catch(e){
@@ -865,7 +815,7 @@ async function loadModels(){
 async function syncModels(btn){
   if(btn){ btn.disabled = true; btn.textContent = '同步中...'; }
   try{
-    const r = await postJSON('/models/sync', {realm: window.VIEW_REALM});
+    const r = await postJSON('/models/sync', {});
     const presets = (r.presets || []).join('、');
     toast('模型已同步：发现 ' + (r.discovered || []).length + ' 个，隐藏 ' + (r.hidden_count || 0) + ' 个'
       + (presets ? '；预设 ' + presets : ''), 'ok');
@@ -884,12 +834,13 @@ function renderAvailableModels(){
   const countEm = document.getElementById('availModelCount');
   if(countEm) countEm.textContent = '(共 ' + MODELS_DATA.length + ' 个)';
   if(!MODELS_DATA.length){
-    tb.innerHTML = '<tr><td colspan="6" class="empty">暂无可用模型</td></tr>';
+    tb.innerHTML = '<tr><td colspan="7" class="empty">暂无可用模型</td></tr>';
     return;
   }
   tb.innerHTML = MODELS_DATA.map(m => {
     // 1. 倍率与折扣（数据驱动：上游 credits + badge tag，见 model-rates-core）
-    const credBadge = modelCreditBadge(m, window.VIEW_REALM);
+    const credBadge = modelCreditBadge(m, 'auto');
+    const realmBadges = modelRealmBadges(m);
 
     // 2. 模型能力 (Vision, Tool calls)
     const caps = [];
@@ -945,6 +896,7 @@ function renderAvailableModels(){
       : '';
     return '<tr>'
       + '<td class="mono"><b>' + esc(m.id) + '</b></td>'
+      + '<td>' + realmBadges + '</td>'
       + '<td>' + credBadge + '</td>'
       + '<td>' + capHtml + '</td>'
       + '<td>' + ctx + '</td>'
@@ -1029,8 +981,10 @@ async function saveModelConfig(btn){
   if(btn){ btn.disabled = true; btn.textContent = '保存中...'; }
   try{
     const order = (MODELS_DATA || []).map(m => m.id);
-    const payload = {model_config: {}};
-    payload.model_config[window.VIEW_REALM] = {hidden: MODEL_CONFIG.hidden || [], order: order};
+    const payload = {model_config: {
+      intl: {hidden: MODEL_CONFIG.hidden || [], order: order},
+      cn: {hidden: MODEL_CONFIG.hidden || [], order: order},
+    }};
     await postJSON('/settings/save', payload);
     toast('模型列表配置已保存', 'ok');
     await loadModels();
@@ -1223,10 +1177,6 @@ setInterval(loadKeyUsage, 30000);
 async function loadGrowthTasks(){
   const sec = document.getElementById("sectionGrowthTasks");
   if(!sec) return;
-  if(window.VIEW_REALM !== 'cn'){
-    sec.style.display = 'none';
-    return;
-  }
   sec.style.display = 'block';
   renderTaskAccountSel();
   try{
@@ -1366,13 +1316,11 @@ async function loadSchedulerStatus(){
     const btnTrig = document.getElementById("btnTriggerSched");
 
     if(dot) dot.className = s.enabled ? 'dot' : 'dot off';
-    const modeText = (window.VIEW_REALM === 'intl')
-      ? (s.mode_intl || '账号 Token 自动保活与凭证常驻 (每日 22:00 集中巡检)')
-      : (s.mode_cn || s.mode || '整点排程');
+    const modeText = s.mode || s.mode_intl || s.mode_cn || '账号 Token 自动保活与凭证常驻';
     if(txt) txt.textContent = s.enabled ? ('运行中 · ' + modeText) : '已暂停';
     if(times) times.textContent = '上次: ' + (s.last_run_time || '-') + ' · 下次: ' + (s.next_run_time || '-');
     if(btn) btn.textContent = s.enabled ? '暂停调度' : '启用调度';
-    if(btnTrig) btnTrig.textContent = (window.VIEW_REALM === 'intl') ? '立即保活刷新' : '立即巡检保活';
+    if(btnTrig) btnTrig.textContent = '立即巡检保活';
   }catch(e){}
 }
 
@@ -1385,7 +1333,7 @@ async function triggerSchedulerNow(btn){
   }catch(e){
     toast("触发失败: " + e.message, "bad");
   }finally{
-    if(btn){ btn.disabled = false; btn.textContent = (window.VIEW_REALM === 'intl') ? '立即保活刷新' : '立即巡检保活'; }
+    if(btn){ btn.disabled = false; btn.textContent = '立即巡检保活'; }
   }
 }
 
@@ -1401,13 +1349,6 @@ async function toggleScheduler(btn){
     if(btn){ btn.disabled = false; }
   }
 }
-function filterRealm(m){
-  REALM_FILTER = m;
-  document.getElementById("fltAll").className = m === "all" ? "active" : "";
-  document.getElementById("fltIntl").className = m === "intl" ? "active" : "";
-  document.getElementById("fltCn").className = m === "cn" ? "active" : "";
-  renderAccounts();
-}
 async function doCheckin(btn){
   btn.disabled = true; const ot = btn.textContent; btn.textContent = "签到中...";
   try {
@@ -1418,7 +1359,7 @@ async function doCheckin(btn){
       const summary = res.map(x => accName(x) + ": " + (x.ok ? "签到成功" : (x.error||x.msg))).join("；");
       toast("每日签到: " + summary, res.some(x => x.ok) ? "ok" : "warn");
     }
-    await initRealm(); loadAccounts(); loadModels();
+    loadAccounts(); loadModels();
   }catch(e){ toast("签到失败: " + e.message, "bad"); }
   finally { btn.disabled = false; btn.textContent = ot; }
 }
@@ -1645,6 +1586,16 @@ function modelCreditBadge(m, realm){
     return '<span class="badge s">0.79x <span style="font-size:10px;color:var(--accent)">(夜间0.5x)</span></span>';
   }
   return '-';
+}
+
+function modelRealmBadges(m){
+  const realms = (((m || {}).x_workbuddy || {}).realms || []).slice();
+  if(!realms.length) return '<span class="badge" style="font-size:11px;color:var(--dim)">未标注</span>';
+  return realms.map(function(realm){
+    return realm === 'cn'
+      ? '<span class="realm-badge-cn">国内版</span>'
+      : '<span class="realm-badge-intl">国际版</span>';
+  }).join(' ');
 }
 /* model-rates-core:end */
 
@@ -1874,7 +1825,7 @@ function renderAccounts(){
   const box = document.getElementById('accounts');
   const all = window.ACCOUNTS || [];
   const st = PAGE_STATE.accounts;
-  const realmList = all.filter(a => !a.realm || a.realm === (window.VIEW_REALM || "intl"));
+  const realmList = all;
   const filtered = filterByQuery(realmList, st.q, accountHay);
   // Sort before slicing: a page-relative sort would reorder page 1 and page 2
   // against each other and disagree with the header indicator.
@@ -1893,7 +1844,7 @@ function renderAccounts(){
   if(countEl){
     countEl.textContent = !all.length ? '' : (st.q
       ? ('筛选 ' + filtered.length + ' / ' + realmList.length + ' 个，启用 ' + usable + ' 个')
-      : ('当前出口 ' + realmList.length + ' 个，启用 ' + usable + ' 个（全量 ' + all.length + '）'));
+      : ('账号池 ' + realmList.length + ' 个，启用 ' + usable + ' 个'));
   }
 
   if(!all.length){
@@ -1914,7 +1865,7 @@ function renderAccounts(){
     return;
   }
   if(!filtered.length){
-    box.innerHTML = '<div class="empty">当前出口下没有匹配「' + esc(st.q) + '」的账号</div>';
+    box.innerHTML = '<div class="empty">账号池中没有匹配「' + esc(st.q) + '」的账号</div>';
     return;
   }
   box.innerHTML = '<table><thead><tr>' + acctHeadHtml()
@@ -1938,7 +1889,7 @@ function filterAccounts(q){
 
 async function loadAccounts(){
   try{
-    const [acct, byAcct] = await Promise.all([getJSON('/accounts?realm=' + encodeURIComponent(window.VIEW_REALM)), getJSON('/usage/by-account')]);
+    const [acct, byAcct] = await Promise.all([getJSON('/accounts'), getJSON('/usage/by-account')]);
     window.ACCOUNTS = acct.accounts || [];
     USAGE_BY_ACCOUNT = {};
     (byAcct.accounts || []).forEach(a => { USAGE_BY_ACCOUNT[a.account] = a; });
@@ -2327,12 +2278,6 @@ async function doImportDesktop(btn, path, realm){
       if(s.pool_uids) window.SCAN_POOL = new Set(s.pool_uids);
       renderDesktopScan(s.detected || []);
     } catch(e2) { /* keep the refreshed toasts; list will refresh on next scan */ }
-    // The scan list is filtered by the current view; tell the user where the
-    // account actually landed so this never looks like a no-op.
-    if(a.realm && a.realm !== window.VIEW_REALM){
-      toast('该账号属于' + (a.realm === 'cn' ? '国内版' : '国际版')
-            + '列表，点击上方选项卡即可查看', 'err');
-    }
   }catch(e){
     toast('导入失败: ' + e.message, 'err');
     btn.disabled = false;
@@ -2358,7 +2303,7 @@ async function refreshRecent(showToast){
   if(RECENT_BUSY || currentMainTab !== 'recent') return;
   RECENT_BUSY = true;
   try{
-    const r = await getJSON('/usage/recent?limit=200&realm=' + encodeURIComponent(window.VIEW_REALM));
+    const r = await getJSON('/usage/recent?limit=200');
     RECENT_ROWS = r.rows || [];
     renderRecent();
     if(showToast) toast('已刷新最近请求', 'ok');
@@ -2407,8 +2352,8 @@ async function refreshInner(){
   let usage, perf;
   try{
     [usage, perf] = await Promise.all([
-      getJSON('/usage?realm=' + encodeURIComponent(window.VIEW_REALM)),
-      getJSON('/usage/perf?realm=' + encodeURIComponent(window.VIEW_REALM)),
+      getJSON('/usage'),
+      getJSON('/usage/perf'),
     ]);
     document.getElementById('statusDot').className = 'dot';
   }catch(e){
@@ -2762,12 +2707,6 @@ function randomKeyValue(){
   return raw || ('wb-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10));
 }
 
-const REALM_CHOICES = [
-  ['auto', '自动路由（按账号和模型）'],
-  ['intl', '固定国际版出口'],
-  ['cn', '固定国内版出口'],
-];
-
 function keyAccountChips(index, row){
   const opts = (window.ACCOUNT_OPTIONS && window.ACCOUNT_OPTIONS.length)
     ? window.ACCOUNT_OPTIONS : (window.ACCOUNTS || []);
@@ -2923,9 +2862,6 @@ document.addEventListener('click', function(){
 });
 
 function keyRowHtml(row, i, flip){
-    const options = REALM_CHOICES.map(([value, label]) =>
-      '<option value="' + value + '"' + (row.realm === value ? ' selected' : '') + '>' + label + '</option>'
-    ).join('');
     const maskedHint = row.masked
       ? '<span class="key-masked" title="已保存的 Key: ' + esc(row.masked) + '">已保存</span>'
       : '';
@@ -2935,8 +2871,7 @@ function keyRowHtml(row, i, flip){
       + '<input class="key-value" type="text" value="' + esc(row.key || '') + '" placeholder="API Key（留空表示不改）" '
       +   'oninput="updateKeyRow(' + i + ',\'key\', this.value)">'
       + '<button class="sec mini" id="copyBtn' + i + '" onclick="copyKeyRow(' + i + ')">复制</button>'
-      + '<select class="key-realm" onchange="updateKeyRow(' + i + ',\'realm\', this.value)">'
-      + options + '</select>'
+      + '<span class="badge s" title="请求会根据模型和账号自动选择国内或国际上游">自动路由</span>'
       + '<label class="key-enable"><input type="checkbox"' + (row.enabled ? ' checked' : '')
       +   ' onchange="updateKeyRow(' + i + ',\'enabled\', this.checked)">启用</label>'
       + '<button class="sec mini" onclick="generateKeyRow(' + i + ')">随机生成</button>'
