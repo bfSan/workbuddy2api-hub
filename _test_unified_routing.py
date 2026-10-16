@@ -140,6 +140,20 @@ try:
     check("incompatible policy made no call", len(calls) == before, calls)
 
     print()
+    print("[2b] hard Key policy cannot be overridden by an explicit query realm")
+    before = len(calls)
+    try:
+        P.open_upstream(
+            {"model": "shared", "messages": [{"role": "user", "content": "policy"}]},
+            target_realm="cn", key_realm="intl",
+        )
+    except ValueError as exc:
+        check("conflicting hard policies are rejected", "policy" in str(exc).lower(), exc)
+    else:
+        check("conflicting hard policies are rejected", False, "query realm overrode Key")
+    check("policy conflict made no call", len(calls) == before, calls)
+
+    print()
     print("[3] 429 fails over from domestic to international")
     P.POOL.affinity.bind_route("failover", "cn", "cn-1")
     before = len(calls)
