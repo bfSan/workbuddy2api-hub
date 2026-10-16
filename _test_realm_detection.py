@@ -70,6 +70,13 @@ account = wb_accounts.Account({
 })
 check("token evidence wins over stored realm", account.realm == "cn", account.realm)
 check("realm source is persisted in memory", account.realm_source in ("issuer", "issuer+domain"), account.realm_source)
+stored_only = wb_accounts.Account({
+    "uid": "stored-only",
+    "realm": "intl",
+    "accessToken": token("https://example.invalid"),
+})
+check("stored realm alone is quarantined", stored_only.realm == "unknown" and not stored_only.ready(),
+      (stored_only.realm, stored_only.realm_source, stored_only.realm_error))
 
 print()
 print("[4] realm source and error survive persistence")

@@ -181,6 +181,9 @@ class Account(object):
         self.realm, self.realm_source, self.realm_error = detect_account_realm(
             token, self.domain, stored_realm
         )
+        if self.realm_source == "stored" and (self.domain or token.count(".") == 2):
+            self.realm = "unknown"
+            self.realm_error = "stored realm is not trusted without issuer or domain evidence"
         if not self.domain and self.realm in ("intl", "cn"):
             self.domain = get_realm_config(self.realm)["domain"]
         self.platform = str(data.get("platform") or "CLI")
