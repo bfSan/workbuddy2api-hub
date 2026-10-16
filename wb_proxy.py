@@ -232,7 +232,7 @@ def row_matches_realm(row, realm):
     if model: return detect_model_realm(model) == realm
     return realm == "intl"
 def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_ms=None, fp=None,
-                account=None):
+                account=None, route_reason="", retry_count=0, failover=False):
     """Accumulate stats, append a JSONL row, and persist the summary."""
     fields = _extract_usage(usage)
     if not fields:
@@ -257,7 +257,13 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
     # PATCH(wb-hub-usage-key) 记下是哪个 Key 发起的
     row.update(wb_patch_key_fields())
     acc = POOL.get(account) if (account and POOL) else None
-    row["realm"] = acc.realm if acc else CURRENT_REALM
+    selected_realm = acc.realm if acc else ""
+    row["realm"] = selected_realm or CURRENT_REALM
+    row["selected_realm"] = selected_realm or row["realm"]
+    row["selected_account"] = account or ""
+    row["route_reason"] = str(route_reason or "")
+    row["retry_count"] = max(0, int(retry_count or 0))
+    row["failover"] = bool(failover)
     # Derived per-request rates (None-safe).
     if gen_ms and gen_ms > 0:
         row["tokens_per_sec"] = round(fields["completion_tokens"] / (gen_ms / 1000.0), 2)
@@ -323,7 +329,8 @@ def _persist_usage(row, summary, fail_label):
     except Exception as exc:
         log("%s: %s" % (fail_label, exc))
 
-def record_error(model, status, message, elapsed_ms=None):
+def record_error(model, status, message, elapsed_ms=None, realm="", account="",
+                 route_reason="", retry_count=0, failover=False):
     """Count a failed request and append it to the log so errors are visible."""
     requested_model = model or "unknown"
     row = {
@@ -335,6 +342,13 @@ def record_error(model, status, message, elapsed_ms=None):
         "status": status,
         "message": str(message)[:200],
         "elapsed_ms": elapsed_ms,
+        "realm": str(realm or ""),
+        "selected_realm": str(realm or ""),
+        "account": str(account or ""),
+        "selected_account": str(account or ""),
+        "route_reason": str(route_reason or ""),
+        "retry_count": max(0, int(retry_count or 0)),
+        "failover": bool(failover),
     }
     row.update(wb_patch_key_fields())
     with _lock:
@@ -908,7 +922,7 @@ def runtime_settings_view():
         keys.append({
             "id": entry.get("id") or "",
             "name": entry.get("name") or "",
-            "realm": entry.get("realm") or "",
+            "realm": wb_settings.normalize_key_realm(entry.get("realm")),
             "enabled": entry.get("enabled", True) is not False,
             # PATCH(wb-hub-key-accounts) 面板要拿已勾选的账号来回显
             "accounts": entry.get("accounts") or [],
@@ -978,6 +992,14 @@ def models_config_view():
             "hidden": entry.get("hidden") or [],
             "order": entry.get("order") or [],
         }
+    try:
+        unified = models_response()
+        out["unified"] = {
+            "visible": [item["id"] for item in unified.get("data") or []],
+            "models": unified.get("data") or [],
+        }
+    except Exception:
+        out["unified"] = {"visible": [], "models": []}
     return {"ok": True, "realms": out}
 
 
@@ -1615,6 +1637,25 @@ def unified_model_registry():
         "intl": fetch_models(realm="intl"),
         "cn": fetch_models(realm="cn"),
     })
+
+
+def models_response(realm=None):
+    """Return the public model union, optionally filtered to one realm."""
+    registry = unified_model_registry()
+    if realm in ("intl", "cn"):
+        entries = []
+        for model_id, record in registry.items():
+            if realm in record.get("realms", ()):
+                entries.append((model_id, record.get("variants", {}).get(realm) or {}))
+        label = realm
+    else:
+        entries = wb_model_registry.merged_entries(registry)
+        label = "auto"
+    return {
+        "object": "list",
+        "data": [model_entry(mid, meta) for mid, meta in entries],
+        "realm": label,
+    }
 def model_entry(mid, meta):
     """Build a rich /v1/models entry from the desktop app catalog metadata.
     The OpenAI spec only names id/object/created/owned_by, so capability data is
@@ -1730,6 +1771,8 @@ def model_entry(mid, meta):
                 badges.append({"text": parts[1].strip(), "color": (parts[2] or "").strip()})
     if badges:
         item["badges"] = badges
+    if isinstance(meta.get("x_workbuddy"), dict):
+        item["x_workbuddy"] = meta["x_workbuddy"]
     return item
 def read_product_config_models(realm=None):
     """Read the desktop app's cached catalog: [(id, meta), ...]."""
@@ -2312,9 +2355,17 @@ def open_upstream(payload, session_key=None, target_realm=None, allow=None,
         affinity_realm=(affinity_route or {}).get("realm"),
         healthy_realms=tuple(healthy.keys()),
     )
+    auto_routing_enabled = os.environ.get("WB_AUTO_REALM_ROUTING", "1").lower() not in (
+        "0", "false", "no", "off"
+    )
+    if not auto_routing_enabled and len(candidates) > 1:
+        candidates = candidates[:1]
     tried = set()
     last_error = None
-    for candidate in candidates:
+    retry_count = 0
+    last_meta = {"realm": "", "account": "", "route_reason": "",
+                 "retry_count": 0, "failover": False}
+    for candidate_index, candidate in enumerate(candidates):
         realm = candidate.realm
         total = sum(
             1 for account in (POOL.accounts if POOL else [])
@@ -2330,6 +2381,13 @@ def open_upstream(payload, session_key=None, target_realm=None, allow=None,
             if account is None:
                 break
             tried.add(account.uid)
+            last_meta = {
+                "realm": account.realm,
+                "account": account.uid,
+                "route_reason": candidate.reason,
+                "retry_count": retry_count,
+                "failover": candidate_index > 0,
+            }
             cfg = wb_accounts.get_realm_config(account.realm)
             chat_url = cfg["chat_upstream"] + CHAT_PATH
             req = urllib.request.Request(chat_url, data=body, method="POST",
@@ -2337,6 +2395,9 @@ def open_upstream(payload, session_key=None, target_realm=None, allow=None,
             try:
                 resp = urllib.request.urlopen(req, timeout=600)
                 account.clear_error(model=requested_model)
+                account._route_reason = candidate.reason
+                account._route_retry_count = retry_count
+                account._route_failover = candidate_index > 0
                 if session_key and POOL:
                     POOL.affinity.bind_route(session_key, account.realm, account.uid)
                 return resp, account
@@ -2350,6 +2411,8 @@ def open_upstream(payload, session_key=None, target_realm=None, allow=None,
                                        single_account=(total <= 1), model=requested_model,
                                        account_wide=(exc.code != 429))
                     last_error = exc
+                    retry_count += 1
+                    last_meta["retry_count"] = retry_count
                     continue
                 raise
             except Exception as exc:
@@ -2359,10 +2422,34 @@ def open_upstream(payload, session_key=None, target_realm=None, allow=None,
                                    single_account=(total <= 1), model=requested_model,
                                    account_wide=True)
                 last_error = exc
+                retry_count += 1
+                last_meta["retry_count"] = retry_count
                 continue
     if last_error is not None:
+        for key, value in last_meta.items():
+            try:
+                setattr(last_error, "_wb_" + key, value)
+            except Exception:
+                pass
         raise last_error
-    raise RuntimeError("no usable account across configured realms: all are disabled, cooling down, or expired")
+    error = RuntimeError("no usable account across configured realms: all are disabled, cooling down, or expired")
+    for key, value in last_meta.items():
+        setattr(error, "_wb_" + key, value)
+    raise error
+
+
+def _route_meta(account=None, error=None):
+    source = error if error is not None else account
+    if source is None:
+        return {"realm": "", "account": "", "route_reason": "",
+                "retry_count": 0, "failover": False}
+    return {
+        "realm": str(getattr(source, "_wb_realm", getattr(source, "realm", "")) or ""),
+        "account": str(getattr(source, "_wb_account", getattr(source, "uid", "")) or ""),
+        "route_reason": str(getattr(source, "_wb_route_reason", getattr(source, "_route_reason", "")) or ""),
+        "retry_count": int(getattr(source, "_wb_retry_count", getattr(source, "_route_retry_count", 0)) or 0),
+        "failover": bool(getattr(source, "_wb_failover", getattr(source, "_route_failover", False))),
+    }
 def extract_session_key(headers, payload):
     key = (
         headers.get("X-Conversation-Id") or
@@ -3522,28 +3609,29 @@ class Handler(BaseHTTPRequestHandler):
         served = "国内版" if owner == "cn" else "国际版"
         used = "国内版" if realm == "cn" else "国际版"
         return ("模型 %s 只在%s提供，但「%s」绑定的是%s出口。"
-                "请改用对应出口的 Key，或把该 Key 的出口改为「跟随面板切换」。"
+                "请改用对应出口的 Key，或把该 Key 的出口改为「自动路由」。"
                 % (model, served, name, used))
     def _request_realm(self, explicit=None):
         """Pick the upstream exit for this request.
-        Priority: an explicit ?realm= argument, then the realm bound to the
-        API key, then the X-Realm header / ?realm= query, and finally the
-        global switch. Returning None lets open_upstream() fall back to
-        model-based detection.
+        Explicit realm filters are compatibility constraints. If none is
+        supplied, a hard Key policy or X-Realm header may constrain the
+        request. Returning None means automatic model/account routing.
         """
         if explicit in ("intl", "cn"):
             return explicit
+        try:
+            query_realm = parse_qs(urlparse(self.path).query).get("realm", [None])[0]
+            if query_realm in ("intl", "cn"):
+                return query_realm
+        except Exception:
+            pass
         bound = self._key_realm()
         if bound in ("intl", "cn"):
             return bound
         header = self.headers.get("X-Realm")
         if header in ("intl", "cn"):
             return header
-        try:
-            query_realm = parse_qs(urlparse(self.path).query).get("realm", [None])[0]
-            return query_realm if query_realm in ("intl", "cn") else None
-        except Exception:
-            return None
+        return None
     def _authorized(self):
         if self._key_ok():
             return True
@@ -3610,7 +3698,8 @@ class Handler(BaseHTTPRequestHandler):
             rep = current_account()
             info = {
                 "ok": True,
-                "realm": "intl",
+                "realm": "auto",
+                "realm_scope": "api routing is selected per account and model",
                 "accounts": len(POOL.accounts) if POOL else 0,
                 "accounts_ready": POOL.count_ready() if POOL else 0,
                 "api_key_required": bool(API_KEY),
@@ -3627,19 +3716,19 @@ class Handler(BaseHTTPRequestHandler):
         # Accept the conventional /v1 prefix and the bare path, because clients
         # differ in whether they append "/v1" themselves.
         if path == "/realm":
-            return self._json(200, {"current": CURRENT_REALM, "options": ["intl", "cn"]})
+            return self._json(200, {"current": CURRENT_REALM, "options": ["intl", "cn"],
+                                    "scope": "panel-view-only"})
         if path in ("/v1/models", "/models"):
             # # PATCH(wb-hub-public-models) 模型列表默认免鉴权（设 WB_PUBLIC_MODELS=0 恢复需要 key），
             # 这样 Codex++ 之类只认 base_url 的客户端也能自动补全下拉列表。
             if os.environ.get("WB_PUBLIC_MODELS", "1") != "1" and not self._authorized():
                 return
-            req_realm = self._request_realm() or CURRENT_REALM
+            req_realm = self._request_realm()
             try:
-                entries = fetch_models(realm=req_realm)
+                result = models_response(req_realm)
             except Exception as exc:
                 return self._error(502, str(exc))
-            data = [model_entry(mid, meta) for mid, meta in entries]
-            return self._json(200, {"object": "list", "data": data, "realm": req_realm or CURRENT_REALM})
+            return self._json(200, result)
         if path in ("/usage", "/v1/usage"):
             if not self._authorized():
                 return
@@ -4121,7 +4210,8 @@ class Handler(BaseHTTPRequestHandler):
             new_realm = payload.get("realm")
             if new_realm in ("intl", "cn"):
                 save_persisted_realm(new_realm)
-            return self._json(200, {"ok": True, "current": CURRENT_REALM, "persisted": True})
+            return self._json(200, {"ok": True, "current": CURRENT_REALM, "persisted": True,
+                                    "scope": "panel-view-only"})
         if path == "/accounts/checkin":
             uid = payload.get("uid")
             targets = [POOL.get(uid)] if uid else [a for a in (POOL.accounts if POOL else []) if a.realm == "cn"]
@@ -4180,8 +4270,7 @@ class Handler(BaseHTTPRequestHandler):
             for account in targets:
                 if account is None:
                     continue
-                ok = account.refresh()
-                account.save(ACCOUNTS_DIR)
+                ok = POOL.refresh_account(account)
                 results.append({"uid": account.uid, "ok": ok, "error": account.last_error})
             return self._json(200, {"results": results})
         if path == "/accounts/set":
@@ -4281,15 +4370,18 @@ class Handler(BaseHTTPRequestHandler):
                                         target_realm=req_realm,
                                         allow=wb_patch_key_uids(self.key_entry),
                                         key_realm=self._key_realm())
+            route = _route_meta(account=account)
         except urllib.error.HTTPError as exc:
             detail = exc.read(600).decode("utf-8", "replace")
             record_error(model, exc.code, detail,
-                         elapsed_ms=int((time.time() - t_start) * 1000))
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         **_route_meta(error=exc))
             return self._error(exc.code, f"upstream {exc.code}: {detail}")
         except Exception as exc:
             message = str(exc)
             record_error(model, 502, message,
-                         elapsed_ms=int((time.time() - t_start) * 1000))
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         **_route_meta(error=exc))
             if message.startswith("no usable account"):
                 return self._error(503, message +
                                    " - add or enable one at the dashboard (/)")
@@ -4324,19 +4416,24 @@ class Handler(BaseHTTPRequestHandler):
                     record_usage(model, holder.get("usage"), stream=True, elapsed_ms=wall,
                                  ttft_ms=first_ms,
                                  gen_ms=(wall - first_ms) if first_ms is not None else None,
-                                 fp=fp, account=account.uid)
+                                 fp=fp, account=account.uid,
+                                 route_reason=route["route_reason"],
+                                 retry_count=route["retry_count"], failover=route["failover"])
                     return
                 wall = int((time.time() - t_start) * 1000)
                 record_usage(model, holder.get("usage"), stream=True, elapsed_ms=wall,
                              ttft_ms=first_ms,
                              gen_ms=(wall - first_ms) if first_ms is not None else None,
-                             fp=fp, account=account.uid)
+                             fp=fp, account=account.uid,
+                             route_reason=route["route_reason"],
+                             retry_count=route["retry_count"], failover=route["failover"])
                 return
             try:
                 chat_obj = aggregate_stream(upstream, model, None)
             except Exception as exc:
                 record_error(model, 502, str(exc),
-                             elapsed_ms=int((time.time() - t_start) * 1000))
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             **route)
                 return self._error(502, f"upstream stream error: {exc}")
             wall = int((time.time() - t_start) * 1000)
             result = (
@@ -4345,7 +4442,8 @@ class Handler(BaseHTTPRequestHandler):
                 else chat_to_response(chat_obj, model, custom_names)
             )
             record_usage(model, chat_obj.get("usage"), stream=False, elapsed_ms=wall, fp=fp,
-                         account=account.uid)
+                         account=account.uid, route_reason=route["route_reason"],
+                         retry_count=route["retry_count"], failover=route["failover"])
             return self._json(200, result)
     def do_POST(self):
         path = self.path.split("?")[0]
@@ -4422,14 +4520,17 @@ class Handler(BaseHTTPRequestHandler):
                                        target_realm=req_realm,
                                        allow=wb_patch_key_uids(self.key_entry),
                                        key_realm=self._key_realm())
+            route = _route_meta(account=account)
         except urllib.error.HTTPError as exc:
             detail = exc.read(600).decode("utf-8", "replace")
             record_error(model, exc.code, detail,
-                         elapsed_ms=int((time.time() - t_start) * 1000))
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         **_route_meta(error=exc))
             return self._error(exc.code, f"upstream {exc.code}: {detail}")
         except Exception as exc:
             message = str(exc)
-            record_error(model, 502, message, elapsed_ms=int((time.time() - t_start) * 1000))
+            record_error(model, 502, message, elapsed_ms=int((time.time() - t_start) * 1000),
+                         **_route_meta(error=exc))
             if message.startswith("no usable account"):
                 return self._error(503, message +
                                    " - add or enable one at the dashboard (/)")
@@ -4471,7 +4572,9 @@ class Handler(BaseHTTPRequestHandler):
                     record_usage(model, last_usage, stream=True,
                                  elapsed_ms=wall, ttft_ms=first_ms,
                                  gen_ms=(wall - first_ms) if first_ms is not None else None,
-                                 fp=fp, account=account.uid)
+                                 fp=fp, account=account.uid,
+                                 route_reason=route["route_reason"],
+                                 retry_count=route["retry_count"], failover=route["failover"])
                     return
                 if not emitted:
                     err = json.dumps({"error": {"message": "empty upstream stream", "type": "server_error"}})
@@ -4482,12 +4585,15 @@ class Handler(BaseHTTPRequestHandler):
                 record_usage(model, last_usage, stream=True,
                              elapsed_ms=wall, ttft_ms=first_ms,
                              gen_ms=(wall - first_ms) if first_ms is not None else None,
-                             fp=fp, account=account.uid)
+                             fp=fp, account=account.uid,
+                             route_reason=route["route_reason"],
+                             retry_count=route["retry_count"], failover=route["failover"])
                 return
             try:
                 result = aggregate_stream(upstream, model, None)
             except Exception as exc:
-                record_error(model, 502, str(exc), elapsed_ms=int((time.time() - t_start) * 1000))
+                record_error(model, 502, str(exc), elapsed_ms=int((time.time() - t_start) * 1000),
+                             **route)
                 return self._error(502, f"upstream stream error: {exc}")
             wall = int((time.time() - t_start) * 1000)
             first_at = result.get("first_chunk_at")
@@ -4496,7 +4602,9 @@ class Handler(BaseHTTPRequestHandler):
             record_usage(model, result.get("usage"), stream=False,
                          elapsed_ms=wall, ttft_ms=first_ms,
                          gen_ms=(wall - first_ms) if first_ms is not None else None,
-                         fp=fp, account=account.uid)
+                         fp=fp, account=account.uid,
+                         route_reason=route["route_reason"],
+                         retry_count=route["retry_count"], failover=route["failover"])
             return self._json(200, result)
 def main():
     global POOL, ACCOUNTS_DIR, API_KEY, SYSTEM_PROMPT, USAGE_DIR, USAGE_LOG, USAGE_SUMMARY
