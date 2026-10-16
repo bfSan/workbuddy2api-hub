@@ -168,7 +168,6 @@ IMAGE="${IMAGE:-localhost/workbuddy2api-hub:latest}"
 ARCHIVE="${1:-${ARCHIVE:-$ROOT_DIR/dist/workbuddy2api-hub-linux-arm64.tar.gz}}"
 SSH_PASSWORD_FILE="${SSH_PASSWORD_FILE:-$DEFAULT_CONFIG_DIR/ssh-password}"
 
-need expect
 need scp
 need ssh
 need gzip
@@ -178,7 +177,13 @@ need shasum
 if [[ ! -r "$SSH_PASSWORD_FILE" && -r /tmp/sshpw ]]; then
   SSH_PASSWORD_FILE=/tmp/sshpw
 fi
-[[ -r "$SSH_PASSWORD_FILE" ]] || die "SSH password file is not readable: $SSH_PASSWORD_FILE"
+
+# Keep password authentication for existing deployments, while allowing the
+# normal SSH key/agent configuration when no password file is present.
+USE_PASSWORD_AUTH=0
+if [[ -r "$SSH_PASSWORD_FILE" ]]; then
+  USE_PASSWORD_AUTH=1
+fi
 
 SHA256="$(LC_ALL=C shasum -a 256 "$ARCHIVE" | awk '{print $1}')"
 STAMP="$(date '+%Y%m%d-%H%M%S')"
@@ -188,7 +193,9 @@ EXPECT_RUNNER="$(mktemp "${TMPDIR:-/tmp}/wb-deploy-expect.XXXXXX")"
 cleanup() { rm -f "$EXPECT_RUNNER"; }
 trap cleanup EXIT
 
-cat > "$EXPECT_RUNNER" <<'EXPECT'
+if [[ "$USE_PASSWORD_AUTH" == "1" ]]; then
+  need expect
+  cat > "$EXPECT_RUNNER" <<'EXPECT'
 #!/usr/bin/expect -f
 set timeout -1
 set password_file [lindex $argv 0]
@@ -209,28 +216,45 @@ expect {
 catch wait result
 exit [lindex $result 3]
 EXPECT
-chmod 700 "$EXPECT_RUNNER"
+  chmod 700 "$EXPECT_RUNNER"
+fi
 
 remote_ssh() {
-  expect "$EXPECT_RUNNER" "$SSH_PASSWORD_FILE" \
+  if [[ "$USE_PASSWORD_AUTH" == "1" ]]; then
+    expect "$EXPECT_RUNNER" "$SSH_PASSWORD_FILE" \
+      ssh -T \
+        -p "$SSH_PORT" \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o PreferredAuthentications=password \
+        -o PubkeyAuthentication=no \
+        "$REMOTE_USER@$REMOTE_HOST" "$@"
+  else
     ssh -T \
       -p "$SSH_PORT" \
       -o StrictHostKeyChecking=no \
       -o UserKnownHostsFile=/dev/null \
-      -o PreferredAuthentications=password \
-      -o PubkeyAuthentication=no \
       "$REMOTE_USER@$REMOTE_HOST" "$@"
+  fi
 }
 
 remote_scp() {
-  expect "$EXPECT_RUNNER" "$SSH_PASSWORD_FILE" \
+  if [[ "$USE_PASSWORD_AUTH" == "1" ]]; then
+    expect "$EXPECT_RUNNER" "$SSH_PASSWORD_FILE" \
+      scp -q \
+        -P "$SSH_PORT" \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o PreferredAuthentications=password \
+        -o PubkeyAuthentication=no \
+        "$@"
+  else
     scp -q \
       -P "$SSH_PORT" \
       -o StrictHostKeyChecking=no \
       -o UserKnownHostsFile=/dev/null \
-      -o PreferredAuthentications=password \
-      -o PubkeyAuthentication=no \
       "$@"
+  fi
 }
 
 printf '\n[1/3] staging package on %s\n' "$REMOTE_HOST"
