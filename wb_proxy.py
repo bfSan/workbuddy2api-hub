@@ -2346,7 +2346,11 @@ def open_upstream(payload, session_key=None, target_realm=None, allow=None,
             log("affinity: derived %s for %d msgs"
                 % (session_key, len(upstream_body.get("messages") or [])))
     affinity_route = POOL.affinity.get_route(session_key) if POOL and session_key else None
-    policy = target_realm if target_realm in ("intl", "cn") else key_realm
+    hard_key = key_realm if key_realm in ("intl", "cn") else ""
+    hard_target = target_realm if target_realm in ("intl", "cn") else ""
+    if hard_key and hard_target and hard_key != hard_target:
+        raise ValueError("conflicting hard route policy: key=%s target=%s" % (hard_key, hard_target))
+    policy = hard_key or hard_target or "auto"
     healthy = POOL.realm_health(model=model, allow=allow) if POOL else {}
     candidates = wb_routing.plan_realms(
         model,
@@ -2414,6 +2418,11 @@ def open_upstream(payload, session_key=None, target_realm=None, allow=None,
                     retry_count += 1
                     last_meta["retry_count"] = retry_count
                     continue
+                for key, value in last_meta.items():
+                    try:
+                        setattr(exc, "_wb_" + key, value)
+                    except Exception:
+                        pass
                 raise
             except Exception as exc:
                 if session_key and POOL:
