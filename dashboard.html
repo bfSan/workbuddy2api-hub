@@ -107,8 +107,6 @@ th.sortable.active .sort-glyph{opacity:1;color:var(--accent)}
 .key-value{flex:1 1 120px;min-width:120px;background:var(--panel);
   border:1px solid var(--line);border-radius:7px;padding:6px 9px;
   color:var(--fg);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
-.key-realm{width:118px;background:var(--panel);border:1px solid var(--line);
-  border-radius:7px;padding:6px 8px;color:var(--fg);font:inherit;font-size:12px}
 .key-enable{display:inline-flex;align-items:center;gap:5px;font-size:12px;
   color:var(--dim);white-space:nowrap}
 .key-masked{font-size:11px;color:var(--dim);white-space:nowrap;cursor:default}
@@ -162,41 +160,15 @@ button.mini{padding:3px 9px;font-size:11px}
 footer{color:var(--dim);font-size:12px;text-align:center;margin-top:28px}
 a{color:var(--accent);text-decoration:none}
 a:hover{text-decoration:underline}
-.realm-switch-group{display:inline-flex;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:3px;gap:3px}
-.realm-pill{background:transparent;border:none;color:var(--dim);font-size:12px;padding:6px 16px;border-radius:8px;cursor:pointer;transition:all .15s}
-.realm-pill:hover{color:var(--fg)}
-.realm-pill.active{background:var(--accent);color:#fff;font-weight:600;box-shadow:var(--shadow-sm)}
 .realm-badge-intl{color:#0369a1;background:rgba(2,132,199,.12);border:1px solid rgba(2,132,199,.3);padding:2px 9px;border-radius:999px;font-size:11px;font-weight:600}
 .realm-badge-cn{color:#b91c1c;background:rgba(220,38,38,.12);border:1px solid rgba(220,38,38,.3);padding:2px 9px;border-radius:999px;font-size:11px;font-weight:600}
-.realm-filter{display:inline-flex;gap:6px;margin-left:8px}
-.realm-filter button{background:var(--panel2);border:1px solid var(--line);color:var(--dim);padding:3px 9px;font-size:11px}
-.realm-filter button.active{border-color:var(--accent);color:var(--accent);background:#fff}
 
 .realm-banner{
   background:var(--panel);border:1px solid var(--line);border-radius:14px;
   padding:16px 20px;margin-bottom:20px;display:flex;align-items:center;
   justify-content:space-between;gap:18px;flex-wrap:wrap;box-shadow:var(--shadow);
 }
-.realm-tabs{display:flex;gap:10px;flex-wrap:wrap}
-.realm-tab{
-  display:flex;align-items:center;gap:12px;padding:10px 18px;border-radius:10px;
-  background:var(--panel2);border:1px solid var(--line);color:var(--dim);
-  cursor:pointer;text-align:left;transition:all .15s;
-}
-.realm-tab:hover{border-color:var(--line-hover);color:var(--fg);background:#fff}
-.realm-tab.active{
-  background:#fff;border-color:var(--accent);color:var(--fg);
-  box-shadow:0 2px 8px rgba(37,99,235,.15);
-}
-.realm-tab .tab-icon{font-size:22px;line-height:1}
-.realm-tab .tab-title{font-size:14px;font-weight:700;display:block;color:var(--fg)}
-.realm-tab .tab-desc{font-size:11px;color:var(--dim);display:block;margin-top:2px}
 .realm-banner-right{display:flex;flex-direction:column;align-items:flex-end;gap:8px}
-.toggle-realm-btn{
-  background:#fff;border:1px solid var(--accent);color:var(--accent);
-  padding:8px 18px;font-size:13px;font-weight:600;border-radius:8px;box-shadow:var(--shadow-sm);cursor:pointer;
-}
-.toggle-realm-btn:hover{background:var(--accent);color:#fff}
 .realm-endpoint-info{font-size:12px;color:var(--dim)}
 
 .main-nav{display:inline-flex;gap:4px;background:var(--panel2);padding:4px;border-radius:10px;border:1px solid var(--line)}
@@ -764,7 +736,6 @@ async function pollLogin(){
 
 window.ACTIVE_GATEWAY_REALM = "auto";
 window.VIEW_REALM = "all";
-window.REALM_FILTER = "all";
 window.MODELS_DATA = [];
 window.ACCOUNTS = [];
 
