@@ -156,6 +156,8 @@ try:
     refreshed = pool.refresh_account(account)
     check("conflicting refresh quarantines account", refreshed and account.realm == "unknown",
           (account.realm, account.realm_error))
+    check("conflicting refresh records a visible error", bool(account.last_error),
+          account.last_error)
     check("unknown refreshed account is not ready", account.ready(model="shared") is False,
           account.realm)
 finally:
