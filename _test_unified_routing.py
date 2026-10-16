@@ -99,7 +99,7 @@ failed_uids = set()
 def fake_urlopen(req, timeout=None):
     uid = req.get_header("X-user-id")
     calls.append((uid, req.full_url))
-    if uid == "cn-1" and uid not in failed_uids:
+    if uid.startswith("cn-") and uid not in failed_uids:
         failed_uids.add(uid)
         raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", {}, None)
     return FakeResponse()
@@ -151,6 +151,35 @@ try:
     check("two calls were made", len(calls) == before + 2, calls)
     check("first call was domestic", calls[-2][1].startswith("https://copilot.tencent.com/"), calls[-2])
     check("second call was international", calls[-1][1].startswith("https://www.workbuddy.ai/"), calls[-1])
+    check("route reason is recorded on selected account",
+          getattr(selected, "_route_reason", "") in ("health", "stable", "affinity", "failover"),
+          getattr(selected, "_route_reason", None))
+    check("cross-realm failover is recorded", getattr(selected, "_route_failover", False) is True,
+          getattr(selected, "_route_failover", None))
+    check("retry count is recorded", getattr(selected, "_route_retry_count", 0) == 1,
+          getattr(selected, "_route_retry_count", None))
+
+    print()
+    print("[4] rollout flag disables cross-realm failover")
+    P.POOL = FakePool([FakeAccount("cn-flag", "cn"), FakeAccount("intl-flag", "intl")])
+    P.POOL.affinity.bind_route("flag", "cn", "cn-flag")
+    old_flag = os.environ.get("WB_AUTO_REALM_ROUTING")
+    os.environ["WB_AUTO_REALM_ROUTING"] = "0"
+    before = len(calls)
+    try:
+        P.open_upstream(
+            {"model": "shared", "messages": [{"role": "user", "content": "flag"}]},
+            session_key="flag", key_realm="auto",
+        )
+    except urllib.error.HTTPError:
+        check("disabled flag stops after first realm", len(calls) == before + 1, calls)
+    else:
+        check("disabled flag stops after first realm", False, "unexpected failover")
+    finally:
+        if old_flag is None:
+            os.environ.pop("WB_AUTO_REALM_ROUTING", None)
+        else:
+            os.environ["WB_AUTO_REALM_ROUTING"] = old_flag
 finally:
     P.POOL = original_pool
     P.urllib.request.urlopen = original_urlopen

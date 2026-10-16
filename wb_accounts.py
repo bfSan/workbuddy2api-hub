@@ -94,7 +94,10 @@ USER_AGENT = REALM_CONFIGS['intl']['chat_ua']
 DEFAULT_UA_VERSION = '5.5.2'
 
 def get_realm_config(realm):
-    return REALM_CONFIGS.get(realm) or REALM_CONFIGS["intl"]
+    normalized = str(realm or "").strip().lower()
+    if normalized not in REALM_CONFIGS:
+        raise ValueError("unknown realm: %s" % (realm or ""))
+    return REALM_CONFIGS[normalized]
 
 def _jwt_claims(token):
     try:
@@ -205,6 +208,7 @@ class Account(object):
                     continue
         self.credits = data.get("credits") or None
         self.last_checkin = data.get("lastCheckin") or None
+        self._affinity = None
 
     def to_dict(self):
         return {
@@ -281,7 +285,7 @@ class Account(object):
             os.remove(self.path)
 
     def ready(self, model=None):
-        if not self.enabled or not self.access_token:
+        if self.realm not in REALM_CONFIGS or not self.enabled or not self.access_token:
             return False
         if self.cooldown_until > time.time():
             return False
@@ -337,9 +341,13 @@ class Account(object):
                 headers["X-Product"] = "SaaS"
         return headers
 
-    def refresh(self):
+    def refresh(self, affinity=None):
+        affinity = affinity if affinity is not None else self._affinity
         if not self.refresh_token:
             self.last_error = "no refresh token; sign in again"
+            return False
+        if self.realm not in REALM_CONFIGS:
+            self.last_error = self.realm_error or "account realm is unknown; sign in again"
             return False
         cfg = get_realm_config(self.realm)
         url = cfg["chat_upstream"] + REFRESH_PATH
@@ -370,9 +378,26 @@ class Account(object):
         if not token:
             self.last_error = "refresh returned no token (%s)" % payload.get("msg")
             return False
+        previous_realm = self.realm
+        previous_uid = self.uid
         self.access_token = token
         self.refresh_token = data.get("refreshToken") or self.refresh_token
         self.expires_at = jwt_exp(token) or self.expires_at
+        # A refresh response may omit domain.  Do not treat the old realm's
+        # domain as fresh evidence when the issuer has moved the account.
+        refreshed_domain = str(data.get("domain") or "")
+        detected_realm, realm_source, realm_error = detect_account_realm(
+            token, refreshed_domain, previous_realm
+        )
+        self.realm = detected_realm
+        self.realm_source = realm_source
+        self.realm_error = realm_error
+        if refreshed_domain:
+            self.domain = refreshed_domain
+        elif self.realm in REALM_CONFIGS:
+            self.domain = get_realm_config(self.realm)["domain"]
+        if affinity is not None and previous_realm != self.realm:
+            affinity.unbind_uid(previous_uid)
         self.last_error = ""
         self.cooldown_until = 0
         if self.path and os.path.exists(os.path.dirname(self.path)):
@@ -525,6 +550,17 @@ class SessionAffinity(object):
             self.bindings[key] = (route, time.time() + self.ttl)
             return dict(route)
 
+    def unbind_uid(self, uid):
+        """Drop every route affinity pointing at an account UID."""
+        uid = str(uid or "")
+        if not uid:
+            return
+        with self._lock:
+            self.bindings = {
+                key: value for key, value in self.bindings.items()
+                if str((value[0] or {}).get("uid") or "") != uid
+            }
+
     def bind_route(self, key, realm, uid):
         if not key or not uid:
             return
@@ -564,6 +600,7 @@ class AccountPool(object):
                     self.log("account %s unreadable: %s" % (name, exc))
                     continue
                 if account.uid:
+                    account._affinity = self.affinity
                     self.accounts.append(account)
             return self.accounts
 
@@ -580,6 +617,7 @@ class AccountPool(object):
 
     def add(self, account):
         with self._lock:
+            account._affinity = self.affinity
             existing = self.get(account.uid)
             if existing is not None:
                 account.added_at = existing.added_at
@@ -691,6 +729,14 @@ class AccountPool(object):
                 account.enabled = bool(enabled)
                 if enabled: account.clear_error()
                 account.save(self.dir)
+
+    def refresh_account(self, account):
+        """Refresh one account and let it invalidate stale route affinity."""
+        if account is None:
+            return False
+        ok = account.refresh(self.affinity)
+        account.save(self.dir)
+        return ok
 
     def count_ready(self, realm=None):
         with self._lock:
@@ -865,7 +911,14 @@ class AccountPool(object):
         profile = blob.get("account") or {}
         token = str(auth.get("accessToken") or "")
         if not token: raise RuntimeError("no accessToken in %s" % path)
-        detected_realm = realm or detect_realm_from_token(token, auth.get("domain"))
+        detected_realm, _source, detection_error = detect_account_realm(
+            token, auth.get("domain"), ""
+        )
+        forced = str(realm or "").strip().lower()
+        if detected_realm == "unknown":
+            raise ValueError("cannot determine desktop credential realm: %s" % detection_error)
+        if forced and detected_realm != forced:
+            raise ValueError("realm conflicts with credential evidence")
         cfg = get_realm_config(detected_realm)
         account = Account({
             "uid": profile.get("uid") or jwt_uid(token),
@@ -1078,17 +1131,17 @@ def normalise_import_row(row, realm=None):
 
     supplied_domain = pick("domain")
     detected, _source, detection_error = detect_account_realm(
-        token, supplied_domain, pick("realm")
+        token, supplied_domain, ""
     )
     forced = str(realm or "").strip().lower()
+    if detected == "unknown":
+        raise ValueError("cannot determine account realm: %s" % detection_error)
     if forced:
         if forced not in ("intl", "cn"):
             raise ValueError("realm must be intl or cn")
         if detected in ("intl", "cn") and detected != forced:
             raise ValueError("realm conflicts with credential evidence")
         detected = forced
-    elif detected == "unknown":
-        raise ValueError("cannot determine account realm: %s" % detection_error)
     cfg = get_realm_config(detected)
 
     raw_uid = str(pick("uid") or "").strip() or jwt_uid(token)
