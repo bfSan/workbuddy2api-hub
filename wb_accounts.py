@@ -508,23 +508,33 @@ class SessionAffinity(object):
         self.bindings = {}
         self._lock = threading.Lock()
     def get(self, key):
-        if not key: return None
+        route = self.get_route(key)
+        return route.get("uid") if route else None
+
+    def get_route(self, key):
+        if not key:
+            return None
         with self._lock:
             entry = self.bindings.get(key)
-            if not entry: return None
-            uid, exp = entry
+            if not entry:
+                return None
+            route, exp = entry
             if time.time() > exp:
                 self.bindings.pop(key, None)
                 return None
-            self.bindings[key] = (uid, time.time() + self.ttl)
-            return uid
-    def bind(self, key, uid):
-        if not key or not uid: return
+            self.bindings[key] = (route, time.time() + self.ttl)
+            return dict(route)
+
+    def bind_route(self, key, realm, uid):
+        if not key or not uid:
+            return
         with self._lock:
             if len(self.bindings) >= self.max_entries:
                 now = time.time()
                 self.bindings = {k: v for k, v in self.bindings.items() if v[1] > now}
-            self.bindings[key] = (uid, time.time() + self.ttl)
+            self.bindings[key] = ({"realm": str(realm or ""), "uid": str(uid)}, time.time() + self.ttl)
+    def bind(self, key, uid):
+        self.bind_route(key, "", uid)
     def unbind(self, key):
         if not key: return
         with self._lock:
@@ -686,6 +696,21 @@ class AccountPool(object):
         with self._lock:
             snapshot = [a for a in self.accounts if not realm or a.realm == realm]
         return sum(1 for a in snapshot if a.enabled and a.access_token)
+
+    def realm_health(self, model=None, allow=None):
+        """Count ready accounts by known realm, honoring an optional UID set."""
+        allow = set(allow) if allow is not None else None
+        with self._lock:
+            snapshot = list(self.accounts)
+        health = {}
+        for account in snapshot:
+            if account.realm not in ("intl", "cn"):
+                continue
+            if allow is not None and account.uid not in allow:
+                continue
+            if account.ready(model=model):
+                health[account.realm] = health.get(account.realm, 0) + 1
+        return health
 
     def pick_for_session(self, realm=None, session_key=None, exclude=None, model=None,
                          allow=None):
