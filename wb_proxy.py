@@ -29,6 +29,7 @@ import uuid
 import wb_accounts
 import wb_catalog
 import wb_model_registry
+import wb_routing
 import wb_settings
 CURRENT_REALM = os.environ.get("WB_PROXY_DEFAULT_REALM", "intl")
 def detect_model_realm(model_id):
@@ -2265,13 +2266,32 @@ def build_upstream_body(payload):
     if "stream_options" not in body:
         body["stream_options"] = {"include_usage": True}
     return body
-def open_upstream(payload, session_key=None, target_realm=None, allow=None):
+def _routing_model_realms(model):
+    owner = exclusive_realm(model)
+    if owner:
+        return (owner,)
+    static_entries = {
+        "intl": [
+            (item.get("id"), item) for item in getattr(wb_catalog, "STATIC_INTL_MODELS", [])
+            if isinstance(item, dict) and item.get("id")
+        ],
+        "cn": [
+            (item.get("id"), item) for item in getattr(wb_catalog, "STATIC_CN_MODELS", [])
+            if isinstance(item, dict) and item.get("id")
+        ],
+    }
+    registry = wb_model_registry.build_registry(static_entries)
+    realms = wb_model_registry.model_realms(registry, model)
+    return realms or ("intl", "cn")
+
+
+def open_upstream(payload, session_key=None, target_realm=None, allow=None,
+                 key_realm="auto"):
     requested_model = payload.get("model") or ""
     model = resolve_preset_model(requested_model)
     upstream_payload = dict(payload)
     if model != requested_model:
         upstream_payload["model"] = model
-    realm = target_realm or detect_model_realm(model) or CURRENT_REALM
     upstream_body = build_upstream_body(upstream_payload)
     body = json.dumps(upstream_body, ensure_ascii=False).encode("utf-8")
     # PATCHED-BY-OPS: 客户端未提供会话标识时，用对话稳定前缀兜底。
@@ -2282,60 +2302,67 @@ def open_upstream(payload, session_key=None, target_realm=None, allow=None):
         if session_key and AFFINITY_DEBUG:
             log("affinity: derived %s for %d msgs"
                 % (session_key, len(upstream_body.get("messages") or [])))
-    # PATCH(wb-hub-cooloff-scope) 尝试次数必须按「这个 Key 真正用得上的号」算。
-    # 选择器也直接接收 allow，避免非白名单账号被选中后白耗一次轮换机会。
-    if POOL:
-        total = sum(
-            1 for _a in POOL.accounts
-            if _a.realm == realm
-            and (allow is None or _a.uid in allow)
-            and _a.ready(model=model)
-        )
-    else:
-        total = 0
-    total = max(1, total)
+    affinity_route = POOL.affinity.get_route(session_key) if POOL and session_key else None
+    policy = target_realm if target_realm in ("intl", "cn") else key_realm
+    healthy = POOL.realm_health(model=model, allow=allow) if POOL else {}
+    candidates = wb_routing.plan_realms(
+        model,
+        _routing_model_realms(model),
+        key_realm=policy,
+        affinity_realm=(affinity_route or {}).get("realm"),
+        healthy_realms=tuple(healthy.keys()),
+    )
     tried = set()
     last_error = None
-    for _ in range(total):
-        account = POOL.pick_for_session(
-            realm=realm, session_key=session_key, exclude=tried, model=model,
-            allow=allow,
-        ) if POOL else None
-        if account is None:
-            break
-        tried.add(account.uid)
-        cfg = wb_accounts.get_realm_config(account.realm)
-        chat_url = cfg["chat_upstream"] + CHAT_PATH
-        req = urllib.request.Request(chat_url, data=body, method="POST",
-                                     headers=account.headers(purpose="chat"))
-        try:
-            resp = urllib.request.urlopen(req, timeout=600)
-            # 成功：清掉这个模型的冷却（其它模型的冷却保留），并解除账号级冷却
-            account.clear_error(model=requested_model)
-            return resp, account
-        except urllib.error.HTTPError as exc:
-            if exc.code in (401, 403, 429):
-                log("account %s rejected (HTTP %s), rotating" % (account.uid[:8], exc.code))
+    for candidate in candidates:
+        realm = candidate.realm
+        total = sum(
+            1 for account in (POOL.accounts if POOL else [])
+            if account.realm == realm
+            and (allow is None or account.uid in allow)
+            and account.ready(model=model)
+        )
+        for _ in range(total):
+            account = POOL.pick_for_session(
+                realm=realm, session_key=session_key, exclude=tried, model=model,
+                allow=allow,
+            ) if POOL else None
+            if account is None:
+                break
+            tried.add(account.uid)
+            cfg = wb_accounts.get_realm_config(account.realm)
+            chat_url = cfg["chat_upstream"] + CHAT_PATH
+            req = urllib.request.Request(chat_url, data=body, method="POST",
+                                         headers=account.headers(purpose="chat"))
+            try:
+                resp = urllib.request.urlopen(req, timeout=600)
+                account.clear_error(model=requested_model)
+                if session_key and POOL:
+                    POOL.affinity.bind_route(session_key, account.realm, account.uid)
+                return resp, account
+            except urllib.error.HTTPError as exc:
+                if exc.code in (401, 403, 429):
+                    log("account %s rejected (HTTP %s), rotating" % (account.uid[:8], exc.code))
+                    if session_key and POOL:
+                        POOL.affinity.unbind(session_key)
+                    account.note_error("HTTP %s" % exc.code,
+                                       cooldown=300 if exc.code == 429 else 60,
+                                       single_account=(total <= 1), model=requested_model,
+                                       account_wide=(exc.code != 429))
+                    last_error = exc
+                    continue
+                raise
+            except Exception as exc:
                 if session_key and POOL:
                     POOL.affinity.unbind(session_key)
-                # 429 = 该模型限流：只冻结这个模型，账号仍可服务其它模型；
-                # 401/403 = 账号/令牌问题：整个账号冷却。
-                account.note_error("HTTP %s" % exc.code,
-                                   cooldown=300 if exc.code == 429 else 60,
+                account.note_error(str(exc)[:120], cooldown=60,
                                    single_account=(total <= 1), model=requested_model,
-                                   account_wide=(exc.code != 429))
+                                   account_wide=True)
                 last_error = exc
                 continue
-            raise
-        except Exception as exc:
-            if session_key and POOL:
-                POOL.affinity.unbind(session_key)
-            account.note_error(str(exc)[:120], cooldown=60, single_account=(total <= 1), model=requested_model, account_wide=True)
-            last_error = exc
-            continue
     if last_error is not None:
         raise last_error
-    raise RuntimeError(f"no usable account for realm '{realm}': all are disabled, cooling down, or expired")
+    raise RuntimeError("no usable account across configured realms: all are disabled, cooling down, or expired")
 def extract_session_key(headers, payload):
     key = (
         headers.get("X-Conversation-Id") or
@@ -4252,7 +4279,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._error(400, blocked, "invalid_request_error")
             upstream, account = open_upstream(chat_req, session_key=session_key,
                                         target_realm=req_realm,
-                                        allow=wb_patch_key_uids(self.key_entry))
+                                        allow=wb_patch_key_uids(self.key_entry),
+                                        key_realm=self._key_realm())
         except urllib.error.HTTPError as exc:
             detail = exc.read(600).decode("utf-8", "replace")
             record_error(model, exc.code, detail,
@@ -4392,7 +4420,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._error(400, blocked, "invalid_request_error")
             upstream, account = open_upstream(payload, session_key=session_key,
                                        target_realm=req_realm,
-                                       allow=wb_patch_key_uids(self.key_entry))
+                                       allow=wb_patch_key_uids(self.key_entry),
+                                       key_realm=self._key_realm())
         except urllib.error.HTTPError as exc:
             detail = exc.read(600).decode("utf-8", "replace")
             record_error(model, exc.code, detail,
