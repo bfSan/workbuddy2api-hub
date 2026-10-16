@@ -824,8 +824,15 @@ async function switchViewRealm(r){
 
 async function toggleActiveGatewayRealm(){
   const next = (window.VIEW_REALM === "intl" ? "cn" : "intl");
-  await switchViewRealm(next);
-  toast("已切换管理视图为: " + (next === "intl" ? "国际版" : "国内版"));
+  try {
+    // Persist only the management view. API traffic is still routed by the
+    // account/model planner and never reads this state.
+    await postJSON("/realm", {realm: next});
+    await switchViewRealm(next);
+    toast("已切换管理视图为: " + (next === "intl" ? "国际版" : "国内版"));
+  } catch(e) {
+    alert("切换管理视图失败: " + e.message);
+  }
 };
 
 async function initRealm(){
