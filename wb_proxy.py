@@ -28,6 +28,7 @@ import urllib.request
 import uuid
 import wb_accounts
 import wb_catalog
+import wb_model_registry
 import wb_settings
 CURRENT_REALM = os.environ.get("WB_PROXY_DEFAULT_REALM", "intl")
 def detect_model_realm(model_id):
@@ -1605,6 +1606,14 @@ def fetch_models(realm=None):
     with _lock:
         _models_cache[r] = {"at": time.time(), "data": entries}
     return entries
+
+
+def unified_model_registry():
+    """Build the public model registry from both realm-visible catalogs."""
+    return wb_model_registry.build_registry({
+        "intl": fetch_models(realm="intl"),
+        "cn": fetch_models(realm="cn"),
+    })
 def model_entry(mid, meta):
     """Build a rich /v1/models entry from the desktop app catalog metadata.
     The OpenAI spec only names id/object/created/owned_by, so capability data is
