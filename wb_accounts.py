@@ -398,7 +398,7 @@ class Account(object):
             self.domain = get_realm_config(self.realm)["domain"]
         if affinity is not None and previous_realm != self.realm:
             affinity.unbind_uid(previous_uid)
-        self.last_error = ""
+        self.last_error = self.realm_error if self.realm == "unknown" else ""
         self.cooldown_until = 0
         if self.path and os.path.exists(os.path.dirname(self.path)):
             self.save(os.path.dirname(self.path))
