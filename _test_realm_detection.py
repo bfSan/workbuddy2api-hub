@@ -53,6 +53,12 @@ conflict = wb_accounts.detect_account_realm(
 check("missing evidence returns unknown", unknown[0] == "unknown", unknown)
 check("conflicting evidence returns unknown", conflict[0] == "unknown", conflict)
 check("conflict explains the error", bool(conflict[2]), conflict)
+try:
+    wb_accounts.get_realm_config("unknown")
+except ValueError as exc:
+    check("unknown realm cannot resolve an upstream config", "unknown realm" in str(exc), exc)
+else:
+    check("unknown realm cannot resolve an upstream config", False, "unexpected fallback")
 
 print()
 print("[3] explicit token evidence overrides stale stored realm")
@@ -85,6 +91,75 @@ except ValueError as exc:
     check("unknown import is rejected", "realm" in str(exc).lower(), exc)
 else:
     check("unknown import is rejected", False, "import unexpectedly accepted")
+
+print()
+print("[6] desktop imports reject unknown credentials")
+with tempfile.TemporaryDirectory() as tmp:
+    path = os.path.join(tmp, "unknown.info")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({
+            "auth": {"accessToken": token("https://example.invalid"),
+                     "domain": "example.invalid"},
+            "account": {"uid": "desktop-unknown"},
+        }, fh)
+    pool = wb_accounts.AccountPool(os.path.join(tmp, "accounts"))
+    try:
+        pool.import_desktop_credential(path=path)
+    except ValueError as exc:
+        check("unknown desktop credential is rejected", "realm" in str(exc).lower(), exc)
+    else:
+        check("unknown desktop credential is rejected", False, "import unexpectedly accepted")
+    try:
+        pool.import_desktop_credential(path=path, realm="cn")
+    except ValueError as exc:
+        check("forced realm does not guess unknown desktop credential", "realm" in str(exc).lower(), exc)
+    else:
+        check("forced realm does not guess unknown desktop credential", False, "forced import unexpectedly accepted")
+
+try:
+    wb_accounts.normalise_import_row({
+        "uid": "u-forced-unknown",
+        "accessToken": token("https://example.invalid"),
+        "domain": "example.invalid",
+    }, realm="cn")
+except ValueError as exc:
+    check("forced realm does not guess unknown import", "realm" in str(exc).lower(), exc)
+else:
+    check("forced realm does not guess unknown import", False, "forced import unexpectedly accepted")
+
+print()
+print("[7] refresh re-detects realm and clears stale affinity")
+cn_token = token("https://copilot.tencent.com/v2/plugin/auth", subject="refresh-user")
+intl_token = token("https://www.workbuddy.ai/v2/plugin/auth", subject="refresh-user")
+account = wb_accounts.Account({
+    "uid": "refresh-user",
+    "accessToken": cn_token,
+    "refreshToken": "refresh-secret",
+    "domain": "copilot.tencent.com",
+})
+pool = wb_accounts.AccountPool(tempfile.mkdtemp())
+pool.add(account)
+pool.affinity.bind_route("refresh-session", "cn", account.uid)
+original_http_json = wb_accounts.http_json
+try:
+    wb_accounts.http_json = lambda *args, **kwargs: {
+        "data": {"accessToken": intl_token, "refreshToken": "refresh-secret-2"}
+    }
+    refreshed = pool.refresh_account(account)
+    check("refresh updates account realm", refreshed and account.realm == "intl", account.realm)
+    check("refresh clears old affinity", pool.affinity.get_route("refresh-session") is None,
+          pool.affinity.get_route("refresh-session"))
+    wb_accounts.http_json = lambda *args, **kwargs: {
+        "data": {"accessToken": token("https://copilot.tencent.com/v2/plugin/auth"),
+                 "domain": "www.workbuddy.ai"}
+    }
+    refreshed = pool.refresh_account(account)
+    check("conflicting refresh quarantines account", refreshed and account.realm == "unknown",
+          (account.realm, account.realm_error))
+    check("unknown refreshed account is not ready", account.ready(model="shared") is False,
+          account.realm)
+finally:
+    wb_accounts.http_json = original_http_json
 
 print()
 print("PASS=%d FAIL=%d" % (PASS, FAIL))

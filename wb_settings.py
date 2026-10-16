@@ -140,8 +140,9 @@ def ensure_launcher_key(accounts_dir):
 
 
 # --------------------------------------------------------------- API keys
-# Each key can be bound to one upstream realm, so several clients can hit
-# different exits at the same time instead of sharing the global switch.
+# Each key can use automatic routing or be bound to one upstream realm, so
+# several clients can hit different exits at the same time without a global
+# switch controlling API traffic.
 
 REALMS = ("auto", "intl", "cn")
 
