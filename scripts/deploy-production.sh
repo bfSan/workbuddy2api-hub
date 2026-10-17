@@ -72,12 +72,12 @@ if [[ "${DEPLOY_REMOTE_MODE:-0}" == "1" ]]; then
       --restart unless-stopped \
       -p "0.0.0.0:$HOST_PORT:$HOST_PORT" \
       -v "$ACCOUNTS_DIR_REMOTE:/app/accounts" \
-      -v "$USAGE_DIR_REMOTE:/app/usage"
-      -v "$TENANT_DATA_REMOTE:/app/data"
-      -e AAC_BASE_URL="${AAC_BASE_URL:-}"
-      -e AAC_CLIENT_ID="${AAC_CLIENT_ID:-workbuddy2api-hub}"
-      -e AAC_REDIRECT_URI="${AAC_REDIRECT_URI:-}"
-      -e WB_DATA_ROOT=/app/data
+      -v "$USAGE_DIR_REMOTE:/app/usage" \
+      -v "$TENANT_DATA_REMOTE:/app/data" \
+      -e AAC_BASE_URL="${AAC_BASE_URL:-}" \
+      -e AAC_CLIENT_ID="${AAC_CLIENT_ID:-workbuddy2api-hub}" \
+      -e AAC_REDIRECT_URI="${AAC_REDIRECT_URI:-}" \
+      -e WB_DATA_ROOT=/app/data \
       -e WB_AUTH_MODE="${WB_AUTH_MODE:-hybrid}" \
       -v "$CACHE_FILE:$CACHE_TARGET:ro" \
       -e TZ=Asia/Shanghai \
