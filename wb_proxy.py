@@ -14,6 +14,7 @@ Only the Python standard library is required.
 import argparse
 import base64
 import hashlib
+import secrets
 from collections import deque
 import re
 import json
