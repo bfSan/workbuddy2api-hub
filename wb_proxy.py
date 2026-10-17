@@ -32,6 +32,7 @@ import wb_model_registry
 import wb_routing
 import wb_settings
 import wb_auth
+import wb_tenants
 CURRENT_REALM = os.environ.get("WB_PROXY_DEFAULT_REALM", "intl")
 def detect_model_realm(model_id):
     if not model_id:
@@ -177,6 +178,7 @@ PANEL = wb_settings.PanelSessions()
 OAUTH_TRANSACTIONS = {}
 OAUTH_LOCK = threading.RLock()
 WB_AUTH_CONFIG = wb_settings.oauth_config()
+TENANT_MANAGER = None
 API_KEY_FILE_SET = False
 def configured_keys():
     """Panel-managed API keys, always read fresh so panel edits apply at once."""
@@ -3597,6 +3599,7 @@ class Handler(BaseHTTPRequestHandler):
     # realm decides the upstream exit for this request alone.
     key_entry = None
     principal = None
+    tenant_runtime = None
     def handle(self):
         try:
             super().handle()
@@ -3661,6 +3664,10 @@ class Handler(BaseHTTPRequestHandler):
         self.principal = _oauth_principal(self)
         if self.principal and self.principal.principal_type == "aac-user":
             self.key_entry = None
+            try:
+                self.tenant_runtime = TENANT_MANAGER.get_or_create(self.principal.aac_user_id, self.principal.workbuddy_user_id) if TENANT_MANAGER else None
+            except Exception:
+                self.tenant_runtime = None
             return True
         self.key_entry = identify_key(self._supplied_key())
         # PATCH(wb-hub-usage-key) 记下调用方身份，供 record_usage / record_error 写入流水
@@ -4750,8 +4757,9 @@ class Handler(BaseHTTPRequestHandler):
                          retry_count=route["retry_count"], failover=route["failover"])
             return self._json(200, result)
 def main():
-    global POOL, ACCOUNTS_DIR, API_KEY, SYSTEM_PROMPT, USAGE_DIR, USAGE_LOG, USAGE_SUMMARY, WB_AUTH_CONFIG
+    global POOL, ACCOUNTS_DIR, API_KEY, SYSTEM_PROMPT, USAGE_DIR, USAGE_LOG, USAGE_SUMMARY, WB_AUTH_CONFIG, TENANT_MANAGER
     WB_AUTH_CONFIG = wb_settings.oauth_config()
+    TENANT_MANAGER = wb_tenants.TenantRuntimeManager(os.environ.get("WB_DATA_ROOT") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
     API_KEY_GENERATED = False
     ap = argparse.ArgumentParser(description="WorkBuddy (workbuddy.ai) -> OpenAI-compatible proxy")
     ap.add_argument("--info", help="path to the WorkBuddy *.info credential file")
