@@ -3663,11 +3663,13 @@ class Handler(BaseHTTPRequestHandler):
             return True
         self.principal = _oauth_principal(self)
         if self.principal and self.principal.principal_type == "aac-user":
-            self.key_entry = None
             try:
                 self.tenant_runtime = TENANT_MANAGER.get_or_create(self.principal.aac_user_id, self.principal.workbuddy_user_id) if TENANT_MANAGER else None
             except Exception:
                 self.tenant_runtime = None
+            supplied = self._supplied_key()
+            scoped = wb_settings.resolve_api_key(supplied, "workbuddy2api-hub", tenant_dir=self.tenant_runtime.root if self.tenant_runtime else None) if supplied and self.tenant_runtime else None
+            self.key_entry = scoped or None
             return True
         self.key_entry = identify_key(self._supplied_key())
         # PATCH(wb-hub-usage-key) 记下调用方身份，供 record_usage / record_error 写入流水
@@ -3735,6 +3737,9 @@ class Handler(BaseHTTPRequestHandler):
         return PANEL.valid(self._panel_token())
     def _management_ok(self):
         return self._panel_ok() or _oauth_principal(self) is not None
+    def _oauth_role(self):
+        principal = _oauth_principal(self)
+        return getattr(principal, "role", "") if principal else ""
     @staticmethod
     def _is_panel_route(path):
         """Management endpoints shown in the web panel.
@@ -3816,6 +3821,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self._is_panel_route(path) and not self._management_ok():
             return self._error(401, "panel password required", "invalid_request_error")
+        if path in ("/settings", "/scheduler", "/tasks") and self._oauth_role() == "user":
+            return self._error(403, "WorkBuddy admin required", "invalid_request_error")
         if path in ("/", "/dashboard", "/ui"):
             return self._dashboard()
         if path == "/panel/status":
@@ -4617,6 +4624,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_panel(path)
         if self._is_panel_route(path) and not self._management_ok():
             return self._error(401, "panel password required", "invalid_request_error")
+        if (path.startswith("/settings") or path.startswith("/scheduler") or path.startswith("/tasks")) and self._oauth_role() == "user":
+            return self._error(403, "WorkBuddy admin required", "invalid_request_error")
         is_account_route = (
             path.startswith("/accounts/")
             or path == "/realm"
