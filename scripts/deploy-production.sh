@@ -36,6 +36,10 @@ if [[ "${DEPLOY_REMOTE_MODE:-0}" == "1" ]]; then
   CACHE_FILE="$DATA_DIR/wbcache/acc-product-config-v3.json"
   CACHE_TARGET="/root/.workbuddy/cache/acc-product-config-v3.json"
   PANEL_PASSWORD_FILE="${PANEL_PASSWORD_FILE:-$DATA_DIR/PANEL_PASSWORD.txt}"
+  # The production AAC service runs on the macOS host while WorkBuddy runs in
+  # rootless Podman. The host LAN address is not routable from that namespace;
+  # Podman exposes the host through host.containers.internal.
+  AAC_BASE_URL_EFFECTIVE="${AAC_CONTAINER_BASE_URL:-${AAC_BASE_URL:-http://host.containers.internal:17345}}"
   ROLLBACK_IMAGE="localhost/workbuddy2api-hub:rollback"
   HEALTH_URL="http://127.0.0.1:$HOST_PORT/health"
   MODELS_URL="http://127.0.0.1:$HOST_PORT/settings/models"
@@ -79,7 +83,7 @@ if [[ "${DEPLOY_REMOTE_MODE:-0}" == "1" ]]; then
       -v "$ACCOUNTS_DIR_REMOTE:/app/accounts" \
       -v "$USAGE_DIR_REMOTE:/app/usage" \
       -v "$TENANT_DATA_REMOTE:/app/data" \
-      -e AAC_BASE_URL="${AAC_BASE_URL:-}" \
+      -e AAC_BASE_URL="$AAC_BASE_URL_EFFECTIVE" \
       -e AAC_CLIENT_ID="${AAC_CLIENT_ID:-workbuddy2api-hub}" \
       -e AAC_REDIRECT_URI="${AAC_REDIRECT_URI:-}" \
       -e WB_DATA_ROOT=/app/data \
@@ -277,7 +281,7 @@ remote_scp "${BASH_SOURCE[0]}" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_SCRIPT"
 
 printf '\n[2/3] replacing production container\n'
 remote_ssh \
-  "DEPLOY_REMOTE_MODE=1 DEPLOY_ARCHIVE='$REMOTE_ARCHIVE' DEPLOY_IMAGE='$IMAGE' DEPLOY_SHA256='$SHA256' bash '$REMOTE_SCRIPT'"
+  "DEPLOY_REMOTE_MODE=1 DEPLOY_ARCHIVE='$REMOTE_ARCHIVE' DEPLOY_IMAGE='$IMAGE' DEPLOY_SHA256='$SHA256' AAC_CONTAINER_BASE_URL='${AAC_CONTAINER_BASE_URL:-http://host.containers.internal:17345}' AAC_CLIENT_ID='${AAC_CLIENT_ID:-workbuddy2api-hub}' AAC_REDIRECT_URI='${AAC_REDIRECT_URI:-http://10.88.86.106:8788/auth/callback}' WB_AUTH_MODE='${WB_AUTH_MODE:-hybrid}' bash '$REMOTE_SCRIPT'"
 
 printf '\n[3/3] deployment finished\n'
 printf '  host    : %s\n' "$REMOTE_HOST"
