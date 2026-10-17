@@ -238,7 +238,7 @@ def row_matches_realm(row, realm):
     if model: return detect_model_realm(model) == realm
     return realm == "intl"
 def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_ms=None, fp=None,
-                account=None, route_reason="", retry_count=0, failover=False):
+                account=None, route_reason="", retry_count=0, failover=False, tenant_id="", owner_user_id="", key_id=None, principal_type=""):
     """Accumulate stats, append a JSONL row, and persist the summary."""
     fields = _extract_usage(usage)
     if not fields:
@@ -247,6 +247,10 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
     resolved_model = resolve_preset_model(requested_model)
     row = {
         "at": time.time(),
+        "tenant_id": str(tenant_id or ""),
+        "owner_user_id": str(owner_user_id or ""),
+        "principal_type": str(principal_type or ""),
+        **({"key_id": str(key_id)} if key_id else {}),
         "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "model": usage_model_label(requested_model, resolved_model),
         "resolved_model": resolved_model,
@@ -490,21 +494,21 @@ def account_display_name(uid, nickname=None, alias=None):
     return alias or str(nickname or "").strip() or (uid[:8] if uid else "")
 
 
-def usage_snapshot(realm=None, ttl=10):
+def usage_snapshot(realm=None, ttl=10, tenant_id="", principal=None):
     """Cached wrapper: the dashboard polls this every few seconds."""
+    if tenant_id and principal and getattr(principal, "principal_type", "") != "local-admin" and getattr(principal, "role", "user") != "admin" and str(getattr(principal, "workbuddy_user_id", "")) != str(tenant_id):
+        raise RuntimeError("WB_TENANT_FORBIDDEN")
     r = realm if realm in ("intl", "cn") else None
-    now = time.time()
+    now = time.time(); cache_key = (r, tenant_id or "")
     with _snap_lock:
-        hit = _snap_cache.get(r)
-        if hit is not None and (now - hit[0]) < ttl:
-            return hit[1]
-    data = _usage_snapshot_uncached(r)
-    with _snap_lock:
-        _snap_cache[r] = (time.time(), data)
+        hit = _snap_cache.get(cache_key)
+        if hit is not None and (now - hit[0]) < ttl: return hit[1]
+    data = _usage_snapshot_uncached(r, tenant_id=tenant_id)
+    with _snap_lock: _snap_cache[cache_key] = (time.time(), data)
     return data
 
 
-def _usage_snapshot_uncached(realm=None):
+def _usage_snapshot_uncached(realm=None, tenant_id=""):
     r = realm if realm in ("intl", "cn") else None
     rep = POOL.representative(realm=r) if POOL else current_account()
     snap = _empty_stats()
@@ -520,6 +524,8 @@ def _usage_snapshot_uncached(realm=None):
                 except Exception:
                     continue
                 if r and not row_matches_realm(row, r):
+                    continue
+                if tenant_id and row.get("tenant_id") not in (tenant_id, ""):
                     continue
                 if row.get("error"):
                     snap["errors"] += 1

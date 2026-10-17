@@ -1,0 +1,12 @@
+import tempfile, os, wb_proxy
+class P: principal_type='aac-user'; workbuddy_user_id='wb-a'; role='user'
+with tempfile.TemporaryDirectory() as td:
+    old=wb_proxy.USAGE_LOG; wb_proxy.USAGE_LOG=os.path.join(td,'u.jsonl')
+    wb_proxy.record_usage('m', {'prompt_tokens':1,'completion_tokens':1,'total_tokens':2}, tenant_id='wb-a', owner_user_id='wb-a', principal_type='aac-user')
+    snap=wb_proxy.usage_snapshot(tenant_id='wb-a', principal=P())
+    assert snap['requests']==1
+    try: wb_proxy.usage_snapshot(tenant_id='tenant-b', principal=P())
+    except Exception: print('PASS: cross tenant usage rejected')
+    else: raise SystemExit('FAIL cross tenant usage')
+    wb_proxy.USAGE_LOG=old
+print('PASS: tenant usage metadata')
