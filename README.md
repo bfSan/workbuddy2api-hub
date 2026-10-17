@@ -244,3 +244,11 @@ export OPENAI_API_KEY="你在看板设置中添加并绑定的API_Key"
 
 1. 本项目为非官方自托管网关，仅供技术研究、逆向协议学习与个人合法授权账号在私有环境测试使用。
 2. 本项目不提供任何账号及额度。请严格遵守官方服务条款，禁止用于任何商业转售、恶意并发或违规滥用。
+
+## AAC OAuth 与租户隔离
+
+WorkBuddy 支持 `AAC_BASE_URL`、`AAC_CLIENT_ID`、`AAC_REDIRECT_URI` 和 `WB_AUTH_MODE=hybrid`。OAuth 用户通过 `/auth/login` 进入 AAC，WorkBuddy 只保存短期本地会话；本地 `/panel/*` 管理员入口继续保留。租户数据放在 `WB_DATA_ROOT/tenants/<aac-user-id>`，旧账号迁移必须显式执行：
+
+```bash
+python scripts/migrate-legacy-tenant.py --source accounts --target data --owner-user-id <workbuddy-user-id> --dry-run
+```

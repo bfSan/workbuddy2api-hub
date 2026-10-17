@@ -32,6 +32,7 @@ if [[ "${DEPLOY_REMOTE_MODE:-0}" == "1" ]]; then
   DATA_DIR="${DATA_DIR:-$HOME/services/hub-data}"
   ACCOUNTS_DIR_REMOTE="$DATA_DIR/accounts"
   USAGE_DIR_REMOTE="$DATA_DIR/usage"
+  TENANT_DATA_REMOTE="$DATA_DIR/data"
   CACHE_FILE="$DATA_DIR/wbcache/acc-product-config-v3.json"
   CACHE_TARGET="/root/.workbuddy/cache/acc-product-config-v3.json"
   PANEL_PASSWORD_FILE="${PANEL_PASSWORD_FILE:-$DATA_DIR/PANEL_PASSWORD.txt}"
@@ -46,6 +47,7 @@ if [[ "${DEPLOY_REMOTE_MODE:-0}" == "1" ]]; then
   [[ -r "$PANEL_PASSWORD_FILE" ]] || die "panel password file is not readable: $PANEL_PASSWORD_FILE"
   [[ -d "$ACCOUNTS_DIR_REMOTE" ]] || die "accounts directory not found: $ACCOUNTS_DIR_REMOTE"
   [[ -d "$USAGE_DIR_REMOTE" ]] || die "usage directory not found: $USAGE_DIR_REMOTE"
+  mkdir -p "$TENANT_DATA_REMOTE"
   [[ -r "$CACHE_FILE" ]] || die "model cache file not readable: $CACHE_FILE"
 
   ACTUAL_SHA="$(LC_ALL=C shasum -a 256 "$DEPLOY_ARCHIVE" | awk '{print $1}')"
@@ -70,7 +72,13 @@ if [[ "${DEPLOY_REMOTE_MODE:-0}" == "1" ]]; then
       --restart unless-stopped \
       -p "0.0.0.0:$HOST_PORT:$HOST_PORT" \
       -v "$ACCOUNTS_DIR_REMOTE:/app/accounts" \
-      -v "$USAGE_DIR_REMOTE:/app/usage" \
+      -v "$USAGE_DIR_REMOTE:/app/usage"
+      -v "$TENANT_DATA_REMOTE:/app/data"
+      -e AAC_BASE_URL="${AAC_BASE_URL:-}"
+      -e AAC_CLIENT_ID="${AAC_CLIENT_ID:-workbuddy2api-hub}"
+      -e AAC_REDIRECT_URI="${AAC_REDIRECT_URI:-}"
+      -e WB_DATA_ROOT=/app/data
+      -e WB_AUTH_MODE="${WB_AUTH_MODE:-hybrid}" \
       -v "$CACHE_FILE:$CACHE_TARGET:ro" \
       -e TZ=Asia/Shanghai \
       -e WB_PROXY_DEFAULT_REALM=cn \
