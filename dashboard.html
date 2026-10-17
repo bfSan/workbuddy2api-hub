@@ -455,7 +455,7 @@ a:hover{text-decoration:underline}
       <div style="font-size:12px;color:var(--dim);margin-top:4px">面板密码与 API Key 均保存在本机 <span class="mono" id="setSettingsFile">settings.json</span>，重启后依然生效</div>
     </div>
 
-    <section>
+    <section id="panelPasswordSection">
       <h2>面板访问密码 <em id="setPwdState"></em></h2>
       <div style="font-size:12px;color:var(--dim);margin-bottom:12px">用于打开本看板。默认密码为 <b>admin</b>，建议立即修改。</div>
       <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
@@ -486,7 +486,7 @@ a:hover{text-decoration:underline}
       <div style="font-size:11px;color:var(--dim);margin-top:10px" id="setKeyHint"></div>
     </section>
 
-    <section>
+    <section id="setRuntimeInfo">
       <h2>运行信息</h2>
       <table>
         <tbody>
@@ -1365,6 +1365,7 @@ let API_KEY = '';
 let PANEL_TOKEN = '';
 try { PANEL_TOKEN = sessionStorage.getItem(PANEL_STORE) || ''; } catch(e) { PANEL_TOKEN = ''; }
 let PANEL_STATUS = {};
+let AAC_ROLE = '';
 (function initKey(){
   try {
     const fromUrl = new URLSearchParams(window.location.search).get('key');
@@ -1396,7 +1397,8 @@ function authHeaders(base){
 
 async function getJSON(url){
   const r = await fetch(url, {cache:'no-store', headers: authHeaders()});
-  if(r.status === 401 || r.status === 403){ panelNeedsLogin(); throw new Error('unauthorized'); }
+  if(r.status === 401){ panelNeedsLogin(); throw new Error('unauthorized'); }
+  if(r.status === 403){ throw new Error('forbidden'); }
   if(!r.ok) throw new Error(r.status);
   return r.json();
 }
@@ -1406,7 +1408,8 @@ async function postJSON(url, body){
   const t = await r.text();
   let parsed = {};
   try { parsed = t ? JSON.parse(t) : {}; } catch(e) { parsed = {raw: t}; }
-  if(r.status === 401 || r.status === 403){ panelNeedsLogin(); throw new Error('unauthorized'); }
+  if(r.status === 401){ panelNeedsLogin(); throw new Error('unauthorized'); }
+  if(r.status === 403){ throw new Error('forbidden'); }
   if(!r.ok) throw new Error((parsed.error && parsed.error.message) || r.status);
   return parsed;
 }
@@ -2537,6 +2540,8 @@ async function bootPanel(){
     const oauth = await fetch('/auth/me', {cache: 'no-store'});
     const me = await oauth.json().catch(() => ({}));
     if(me.authenticated){
+      AAC_ROLE = (me.principal && me.principal.role) || 'user';
+      applyRoleUI();
       panelHideGate();
       await startDashboard();
       return;
@@ -2593,6 +2598,19 @@ async function startDashboard(){
     setInterval(loadSchedulerStatus, 30000),
     setInterval(loadAccounts, 15000),
   ];
+}
+
+function applyRoleUI(){
+  const admin = AAC_ROLE === 'admin' || !!PANEL_TOKEN;
+  const hide = id => { const el = document.getElementById(id); if(el) el.style.display = 'none'; };
+  if(!admin){
+    hide('btnNavLogs'); hide('pageLogs');
+    ['btnTriggerSched','btnToggleSched','btnCheckin','btnScanDesktop'].forEach(hide);
+    ['btnModelSync','btnModelEdit','btnModelSave'].forEach(hide);
+    document.querySelectorAll('[onclick*="openLoginModal"],[onclick*="exportAccounts"],[onclick*="openImport"],[onclick*="queryCredits"],[onclick*="setAll("]').forEach(el => el.style.display='none');
+    const pwd = document.getElementById('panelPasswordSection'); if(pwd) pwd.style.display='none';
+    const info = document.getElementById('setRuntimeInfo'); if(info) info.style.display='none';
+  }
 }
 
 async function loadSettings(showToast){
@@ -2987,6 +3005,7 @@ async function saveApiKeys(btn){
 }
 
 function switchMainTab(tab){
+  if(tab === 'logs' && AAC_ROLE === 'user') tab = 'gateway';
   currentMainTab = tab;
   const btnGateway = document.getElementById('btnNavGateway');
   const btnRecent = document.getElementById('btnNavRecent');
