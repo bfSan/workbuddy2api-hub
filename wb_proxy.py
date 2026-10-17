@@ -3735,6 +3735,12 @@ class Handler(BaseHTTPRequestHandler):
             return True
         self.principal = _oauth_principal(self)
         if self.principal and self.principal.principal_type == "aac-user":
+            # AAC administrators operate the legacy/global workspace.  Only
+            # ordinary users get a private tenant runtime.
+            if getattr(self.principal, "role", "") == "admin":
+                _REQUEST_RUNTIME.set(None)
+                wb_patch_set_key(None)
+                return True
             try:
                 self.tenant_runtime = TENANT_MANAGER.get_or_create(self.principal.aac_user_id, self.principal.workbuddy_user_id) if TENANT_MANAGER else None
             except Exception:
@@ -3823,7 +3829,8 @@ class Handler(BaseHTTPRequestHandler):
     def _panel_ok(self):
         return PANEL.valid(self._panel_token())
     def _management_ok(self):
-        return self._panel_ok() or _oauth_principal(self) is not None
+        principal = _oauth_principal(self)
+        return self._panel_ok() or bool(principal and getattr(principal, "role", "") == "admin")
     def _oauth_role(self):
         principal = _oauth_principal(self)
         return getattr(principal, "role", "") if principal else ""
@@ -3916,9 +3923,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        if self._is_panel_route(path) and not self._management_ok():
+        if self._is_panel_route(path) and not self._management_ok() and not _oauth_principal(self):
             return self._error(401, "panel password required", "invalid_request_error")
-        if path in ("/settings", "/scheduler", "/tasks") and self._oauth_role() == "user":
+        if path in ("/scheduler", "/tasks", "/logs") and self._oauth_role() == "user":
             return self._error(403, "WorkBuddy admin required", "invalid_request_error")
         if path in ("/", "/dashboard", "/ui"):
             return self._dashboard()
@@ -4120,10 +4127,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             return self._json(200, runtime_settings_view())
         if path == "/settings/models":
-            if not self._management_ok():
+            if not self._management_ok() and not _oauth_principal(self):
                 return self._error(401, "login required", "invalid_request_error")
             return self._json(200, models_config_view())
         if path == "/logs":
+            if self._oauth_role() == "user":
+                return self._error(403, "WorkBuddy admin required", "invalid_request_error")
             if not self._authorized():
                 return
             try:
@@ -4213,11 +4222,12 @@ class Handler(BaseHTTPRequestHandler):
         except BadJSON:
             self._error(400, "invalid JSON body", "invalid_request_error")
             return None
-    def _handle_settings_save(self):
+    def _handle_settings_save(self, payload=None):
         """Persist panel-managed settings from the web settings tab."""
-        payload = self._payload_or_error()
         if payload is None:
-            return
+            payload = self._payload_or_error()
+            if payload is None:
+                return
         reply = {}
         if "api_keys" in payload:
             raw = payload.get("api_keys")
@@ -4703,8 +4713,18 @@ class Handler(BaseHTTPRequestHandler):
         self._begin_request()
         path = self.path.split("?")[0]
         if path == "/settings/save":
-            if not self._panel_ok():
+            if not self._key_ok():
+                return self._error(401, "login required", "invalid_request_error")
+            principal = _oauth_principal(self)
+            if not self._panel_ok() and not (principal and getattr(principal, "role", "") in ("admin", "user")):
                 return self._error(401, "panel password required", "invalid_request_error")
+            if principal and getattr(principal, "role", "") == "user":
+                payload = self._payload_or_error()
+                if payload is None:
+                    return
+                if set(payload) - {"api_keys"}:
+                    return self._error(403, "普通用户只能管理自己的 API Key", "invalid_request_error")
+                return self._handle_settings_save(payload)
             return self._handle_settings_save()
         if path == "/models/sync":
             if not self._panel_ok():
@@ -4720,9 +4740,9 @@ class Handler(BaseHTTPRequestHandler):
                                    "upstream_error")
         if path in ("/panel/login", "/panel/logout", "/panel/password"):
             return self._handle_panel(path)
-        if self._is_panel_route(path) and not self._management_ok():
+        if self._is_panel_route(path) and not self._management_ok() and not _oauth_principal(self):
             return self._error(401, "panel password required", "invalid_request_error")
-        if (path.startswith("/settings") or path.startswith("/scheduler") or path.startswith("/tasks")) and self._oauth_role() == "user":
+        if (path.startswith("/scheduler") or path.startswith("/tasks") or path.startswith("/logs")) and self._oauth_role() == "user":
             return self._error(403, "WorkBuddy admin required", "invalid_request_error")
         is_account_route = (
             path.startswith("/accounts/")
