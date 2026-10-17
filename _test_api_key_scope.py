@@ -1,5 +1,6 @@
 import os, tempfile, time
 import wb_settings
+import wb_tenants
 
 def check(name, condition):
     if not condition: raise SystemExit("FAIL: "+name)
@@ -10,3 +11,49 @@ with tempfile.TemporaryDirectory() as td:
     check("correct app resolves", wb_settings.resolve_api_key(issued["credential"],"workbuddy2api-hub",tenant_dir=td).owner_user_id == "wb-a")
     check("wrong app rejected", wb_settings.resolve_api_key(issued["credential"],"qoder2api-hub",tenant_dir=td) is None)
     check("expired key rejected", wb_settings.resolve_api_key(issued["credential"],"workbuddy2api-hub",tenant_dir=td,now=time.time()+10**9) is None)
+
+with tempfile.TemporaryDirectory() as root:
+    manager = wb_tenants.TenantRuntimeManager(root)
+    tenant = manager.get_or_create('aac-a', 'wb-a')
+    issued = wb_settings.issue_user_api_key(tenant.root, 'wb-a', 'indexed')
+    resolved = manager.resolve_api_key_tenant(issued['credential'])
+    check('api key resolves tenant without session', resolved is not None and resolved.workbuddy_user_id == 'wb-a')
+    check('unknown api key fails closed', manager.resolve_api_key_tenant('wbk_unknown') is None)
+
+with tempfile.TemporaryDirectory() as root:
+    manager = wb_tenants.TenantRuntimeManager(root)
+    a = manager.get_or_create('aac-a', 'wb-a')
+    b = manager.get_or_create('aac-b', 'wb-b')
+    issued = wb_settings.issue_user_api_key(a.root, 'wb-a', 'duplicate')
+    manager.register_api_key_owner(issued['credential'], a)
+    try:
+        manager.register_api_key_owner(issued['credential'], b)
+    except wb_tenants.TenantError as exc:
+        check('duplicate key owner fails closed', exc.code == 'WB_API_KEY_OWNER_CONFLICT')
+    else:
+        check('duplicate key owner fails closed', False)
+
+with tempfile.TemporaryDirectory() as root:
+    manager = wb_tenants.TenantRuntimeManager(root)
+    tenant = manager.get_or_create('aac-issued', 'wb-issued')
+    issued = manager.issue_api_key(tenant, 'managed')
+    check('manager-issued key is indexed', manager.resolve_api_key_tenant(issued['credential']).workbuddy_user_id == 'wb-issued')
+
+with tempfile.TemporaryDirectory() as root:
+    import wb_proxy
+    manager = wb_tenants.TenantRuntimeManager(root)
+    tenant = manager.get_or_create('aac-handler', 'wb-handler')
+    issued = manager.issue_api_key(tenant, 'handler')
+    old_manager = wb_proxy.TENANT_MANAGER
+    wb_proxy.TENANT_MANAGER = manager
+    handler = wb_proxy.Handler.__new__(wb_proxy.Handler)
+    handler.key_entry = None; handler.principal = None; handler.tenant_runtime = None
+    handler._panel_ok = lambda: False
+    handler._supplied_key = lambda: issued['credential']
+    handler.headers = {}
+    try:
+        check('handler resolves standalone key tenant', handler._key_ok() and handler.tenant_runtime.workbuddy_user_id == 'wb-handler')
+        check('handler key uses tenant pool', wb_proxy.POOL.accounts is tenant.pool.accounts)
+    finally:
+        wb_proxy.TENANT_MANAGER = old_manager
+        wb_proxy._REQUEST_RUNTIME.set(None)

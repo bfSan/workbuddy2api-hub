@@ -48,3 +48,28 @@ node --test tests/oauth-persistence.test.mjs tests/oauth-http.test.mjs tests/oau
 ## 上线前阻塞项
 
 当前实现保留旧 `AccountPool` 全局路径作为兼容层，尚未把所有上游请求、settings、usage 和 scheduler 调用全部切换到 `TenantRuntime`；因此不能直接宣称已完成生产级多用户隔离。另一个限制是独立 API Key 请求目前需要先绑定到 tenant directory，尚未实现无会话情况下的全局 tenant-index 查找。两项都应在开启多用户生产模式前补齐。
+
+## 请求级租户隔离补强（2026-10-17）
+
+已补齐此前两个上线前阻塞项的核心路径：
+
+- `TenantRuntime` 懒加载独立 `AccountPool`，并为每个租户提供独立 settings、usage、scheduler 状态目录。
+- HTTP 请求通过 `ContextVar` 绑定当前 runtime；`open_upstream()`、账号路由、model/settings/alias、usage 和 scheduler 通过代理读取当前租户对象。
+- OAuth 会话按 AAC 用户创建 runtime；无浏览器会话的用户 API Key 先通过 `tenant-index.json` 定位 owner，再加载对应 runtime。
+- tenant index 使用 SHA-256 key 指纹，不保存明文 Key；未知 Key、过期 Key、跨租户重复绑定均 fail-closed。
+- keep-alive 请求开始时清理上一个请求的身份和 Key 上下文，避免连接复用串租户。
+
+新增/更新验证：
+
+```text
+_test_request_runtime.py                         PASS
+_test_tenant_isolation.py                        PASS
+_test_api_key_scope.py                           PASS
+_test_scheduler_tenant_scope.py                 PASS
+_test_usage_tenant_scope.py                     PASS
+全量 _test_*.py（排除缺少 playwright 的 browser 测试） PASS
+python -m py_compile ...                         PASS
+git diff --check                                 PASS
+```
+
+仍未宣称生产多租户最终完成：真实 AAC 环境的双用户浏览器验收、独立 Key 的端到端 HTTP 验收，以及历史 legacy 数据迁移后的真实凭证轮换仍需上线前执行。

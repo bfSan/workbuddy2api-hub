@@ -67,9 +67,34 @@ class TenantRuntime:
         self.accounts = os.path.join(root, "accounts")
         self.settings = TenantFileStore(os.path.join(root, "settings.json"), workbuddy_user_id, app_id)
         self.usage = os.path.join(root, "usage")
+        self.usage_log = os.path.join(self.usage, "usage.jsonl")
+        self.usage_summary = os.path.join(self.usage, "usage-summary.json")
+        self._pool = None
+        self._pool_lock = threading.RLock()
+        self._scheduler = None
+        self._scheduler_lock = threading.RLock()
         self.scheduler_state = TenantFileStore(os.path.join(root, "scheduler.json"), workbuddy_user_id, app_id)
         self.user = TenantFileStore(os.path.join(root, "user.json"), workbuddy_user_id, app_id)
         if not self.user.load(): self.user.save({"aac_user_id": aac_user_id, "workbuddy_user_id": workbuddy_user_id, "role": "user", "status": "active", "created_at": time.time()})
+
+    @property
+    def pool(self):
+        """Load credentials only when this tenant handles a request."""
+        with self._pool_lock:
+            if self._pool is None:
+                import wb_accounts
+                self._pool = wb_accounts.AccountPool(self.accounts)
+                self._pool.load()
+            return self._pool
+
+    @property
+    def scheduler(self):
+        with self._scheduler_lock:
+            if self._scheduler is None:
+                from wb_scheduler import Scheduler
+                self._scheduler = Scheduler(self.pool)
+                self._scheduler.start()
+            return self._scheduler
 
 
 class TenantRuntimeManager:
@@ -80,6 +105,7 @@ class TenantRuntimeManager:
         _mkdir_private(self.data_root); _mkdir_private(self.tenants_root)
         self.max_cached = max_cached
         self._cache = {}; self._lock = threading.RLock()
+        self.index_path = os.path.join(self.data_root, "tenant-index.json")
     def get_or_create(self, aac_user_id, workbuddy_user_id):
         aac_user_id = _safe_component(aac_user_id, "aac_user_id"); workbuddy_user_id = _safe_component(workbuddy_user_id, "workbuddy_user_id")
         key = workbuddy_user_id
@@ -91,6 +117,75 @@ class TenantRuntimeManager:
             self._cache[key] = runtime
             while len(self._cache) > self.max_cached: self._cache.pop(next(iter(self._cache)))
             return runtime
+
+    def _load_index(self):
+        try:
+            with open(self.index_path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except (FileNotFoundError, ValueError, OSError):
+            return {}
+
+    def _save_index(self, data):
+        fd, tmp = tempfile.mkstemp(prefix=".tenant-index-", dir=self.data_root, text=True)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2); fh.write("\n")
+            os.chmod(tmp, 0o600); os.replace(tmp, self.index_path)
+        finally:
+            if os.path.exists(tmp): os.unlink(tmp)
+
+    def register_api_key_owner(self, credential, runtime):
+        if not credential or runtime is None: return None
+        digest = hashlib.sha256(str(credential).encode()).hexdigest()
+        with self._lock:
+            index = self._load_index()
+            owner = {"aac_user_id": runtime.aac_user_id, "workbuddy_user_id": runtime.workbuddy_user_id}
+            existing = index.get(digest)
+            if existing and (existing.get("aac_user_id"), existing.get("workbuddy_user_id")) != (owner["aac_user_id"], owner["workbuddy_user_id"]):
+                raise TenantError("WB_API_KEY_OWNER_CONFLICT", "api key is already bound to another tenant", 409)
+            index[digest] = owner
+            self._save_index(index)
+        return runtime
+
+    def issue_api_key(self, runtime, label, expires_at=None):
+        import wb_settings
+        issued = wb_settings.issue_user_api_key(runtime.root, runtime.workbuddy_user_id, label, expires_at=expires_at)
+        self.register_api_key_owner(issued.get("credential"), runtime)
+        return issued
+
+    def resolve_api_key_tenant(self, credential):
+        """Resolve a user key without a browser session, failing closed."""
+        credential = str(credential or "").strip()
+        if not credential: return None
+        digest = hashlib.sha256(credential.encode()).hexdigest()
+        with self._lock:
+            index = self._load_index()
+            entry = index.get(digest)
+            if entry:
+                try:
+                    runtime = self.get_or_create(entry["aac_user_id"], entry["workbuddy_user_id"])
+                    import wb_settings
+                    if wb_settings.resolve_api_key(credential, self.app_id, tenant_dir=runtime.root):
+                        return runtime
+                except (KeyError, ValueError, OSError):
+                    pass
+            # Rebuild lazily for keys created by older versions or direct API use.
+            for aac_id in os.listdir(self.tenants_root) if os.path.isdir(self.tenants_root) else []:
+                root = os.path.join(self.tenants_root, aac_id)
+                if not os.path.isdir(root): continue
+                user = TenantFileStore(os.path.join(root, "user.json"), "unknown", self.app_id).load()
+                wb_id = str(user.get("workbuddy_user_id") or "")
+                if not wb_id: continue
+                runtime = self.get_or_create(aac_id, wb_id)
+                import wb_settings
+                principal = wb_settings.resolve_api_key(credential, self.app_id, tenant_dir=runtime.root)
+                if principal:
+                    index[digest] = {"aac_user_id": aac_id, "workbuddy_user_id": wb_id}
+                    self._save_index(index)
+                    return runtime
+        return None
+
     def assert_owner(self, resource_owner_id, principal):
         if getattr(principal, "principal_type", "") == "local-admin": return None
         if str(resource_owner_id or "") != str(getattr(principal, "workbuddy_user_id", "")):
