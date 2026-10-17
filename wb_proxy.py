@@ -1038,8 +1038,8 @@ def runtime_settings_view():
         "api_key_masked": masked,
         "auth_required": auth_required(),
         "api_keys": keys,
-        "accounts_dir": ACCOUNTS_DIR,
-        "usage_dir": USAGE_DIR,
+        "accounts_dir": str(ACCOUNTS_DIR),
+        "usage_dir": str(USAGE_DIR),
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
         "version": "1.2.0",
     }
@@ -4014,7 +4014,7 @@ class Handler(BaseHTTPRequestHandler):
                 "accounts": account_views(realm=(query.get('realm', [None])[0]
                                                  if query.get('realm', [None])[0] in ("intl", "cn")
                                                  else None)),
-                "storage": ACCOUNTS_DIR,
+                "storage": str(ACCOUNTS_DIR),
                 "usable": POOL.count_ready() if POOL else 0,
             })
         if path == "/accounts/export":
