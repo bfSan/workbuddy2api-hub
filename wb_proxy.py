@@ -565,7 +565,7 @@ def _usage_snapshot_uncached(realm=None, tenant_id=""):
     except Exception as exc:
         log(f"usage snapshot read failed: {exc}")
     snap["since"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(snap.get("started", time.time())))
-    snap["log_file"] = USAGE_LOG
+    snap["log_file"] = str(USAGE_LOG)
     snap["realm"] = r or "auto"
     aliases = wb_patch_account_aliases()
     snap["accounts_map"] = {
@@ -4120,8 +4120,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             return self._json(200, runtime_settings_view())
         if path == "/settings/models":
-            if not self._panel_ok():
-                return self._error(401, "panel password required", "invalid_request_error")
+            if not self._management_ok():
+                return self._error(401, "login required", "invalid_request_error")
             return self._json(200, models_config_view())
         if path == "/logs":
             if not self._authorized():

@@ -11,6 +11,7 @@ with tempfile.TemporaryDirectory() as root:
     token = wb_proxy._REQUEST_RUNTIME.set(runtime)
     try:
         json.dumps(wb_proxy.runtime_settings_view())
+        json.dumps(wb_proxy.usage_snapshot(tenant_id="wb-json"))
         json.dumps({"storage": str(wb_proxy.ACCOUNTS_DIR), "usage": str(wb_proxy.USAGE_DIR)})
     finally:
         wb_proxy._REQUEST_RUNTIME.reset(token)
