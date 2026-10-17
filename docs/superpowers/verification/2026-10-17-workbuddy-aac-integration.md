@@ -44,3 +44,7 @@ node --test tests/oauth-persistence.test.mjs tests/oauth-http.test.mjs tests/oau
 - 旧账号必须通过 `scripts/migrate-legacy-tenant.py` 显式绑定 owner；dry-run 只输出脱敏 owner 前缀、文件数和字节数。
 - Qoder 没有加入 WorkBuddy 的 Docker/Compose 挂载、OAuth client、配置或数据路径。
 - 本阶段仍需在真实 AAC 环境执行两名用户、一个 WorkBuddy admin、一个 local-admin 和一个被禁用用户的浏览器手工验收；当前自动化测试使用脱敏 fixture 用户。
+
+## 上线前阻塞项
+
+当前实现保留旧 `AccountPool` 全局路径作为兼容层，尚未把所有上游请求、settings、usage 和 scheduler 调用全部切换到 `TenantRuntime`；因此不能直接宣称已完成生产级多用户隔离。另一个限制是独立 API Key 请求目前需要先绑定到 tenant directory，尚未实现无会话情况下的全局 tenant-index 查找。两项都应在开启多用户生产模式前补齐。
