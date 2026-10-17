@@ -252,3 +252,5 @@ WorkBuddy 支持 `AAC_BASE_URL`、`AAC_CLIENT_ID`、`AAC_REDIRECT_URI` 和 `WB_A
 ```bash
 python scripts/migrate-legacy-tenant.py --source accounts --target data --owner-user-id <workbuddy-user-id> --dry-run
 ```
+
+验收记录见 `docs/superpowers/verification/2026-10-17-workbuddy-aac-integration.md`。部署前必须在目标环境配置 AAC 三项地址变量，并先用 migration CLI 的 `--dry-run` 检查旧数据归属。
