@@ -27,3 +27,25 @@ with tempfile.TemporaryDirectory() as root:
         check("cross tenant denied", exc.code == "WB_TENANT_FORBIDDEN")
     else:
         check("cross tenant denied", False)
+
+with tempfile.TemporaryDirectory() as root:
+    manager = wb_tenants.TenantRuntimeManager(root)
+    a = manager.get_or_create('aac-a', 'wb-a')
+    b = manager.get_or_create('aac-b', 'wb-b')
+    check('runtime exposes independent lazy pools', a.pool is not b.pool and a.pool.dir != b.pool.dir)
+    check('runtime usage logs are isolated', a.usage_log != b.usage_log and a.settings.path != b.settings.path)
+
+import wb_proxy
+with tempfile.TemporaryDirectory() as root:
+    manager = wb_tenants.TenantRuntimeManager(root)
+    runtime = manager.get_or_create('aac-request', 'wb-request')
+    class FakePool:
+        accounts = []
+    runtime._pool = FakePool()
+    token = wb_proxy._REQUEST_RUNTIME.set(runtime)
+    try:
+        check('request pool proxy follows tenant', wb_proxy.POOL is not runtime._pool and wb_proxy.POOL.accounts is runtime._pool.accounts)
+        check('request settings path follows tenant', str(wb_proxy.ACCOUNTS_DIR) == runtime.root)
+        check('request usage path follows tenant', str(wb_proxy.USAGE_LOG) == runtime.usage_log)
+    finally:
+        wb_proxy._REQUEST_RUNTIME.reset(token)

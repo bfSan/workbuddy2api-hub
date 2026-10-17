@@ -23,6 +23,7 @@ import socket
 import sys
 import threading
 import time
+import contextvars
 import urllib.error
 import urllib.request
 import uuid
@@ -240,6 +241,11 @@ def row_matches_realm(row, realm):
 def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_ms=None, fp=None,
                 account=None, route_reason="", retry_count=0, failover=False, tenant_id="", owner_user_id="", key_id=None, principal_type=""):
     """Accumulate stats, append a JSONL row, and persist the summary."""
+    runtime = _REQUEST_RUNTIME.get()
+    if runtime is not None:
+        tenant_id = tenant_id or runtime.workbuddy_user_id
+        owner_user_id = owner_user_id or runtime.workbuddy_user_id
+        principal_type = principal_type or "aac-user"
     fields = _extract_usage(usage)
     if not fields:
         return None
@@ -340,11 +346,20 @@ def _persist_usage(row, summary, fail_label):
         log("%s: %s" % (fail_label, exc))
 
 def record_error(model, status, message, elapsed_ms=None, realm="", account="",
-                 route_reason="", retry_count=0, failover=False):
+                 route_reason="", retry_count=0, failover=False,
+                 tenant_id="", owner_user_id="", principal_type=""):
     """Count a failed request and append it to the log so errors are visible."""
+    runtime = _REQUEST_RUNTIME.get()
+    if runtime is not None:
+        tenant_id = runtime.workbuddy_user_id
+        owner_user_id = runtime.workbuddy_user_id
+        principal_type = "aac-user"
     requested_model = model or "unknown"
     row = {
         "at": time.time(),
+        "tenant_id": str(tenant_id or ""),
+        "owner_user_id": str(owner_user_id or ""),
+        "principal_type": str(principal_type or ""),
         "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "model": usage_model_label(requested_model, resolve_preset_model(requested_model)),
         "resolved_model": resolve_preset_model(requested_model),
@@ -677,10 +692,55 @@ def recent_usage(limit=100, realm=None):
         row["account_alias"] = alias
         row["account_name"] = account_display_name(uid, nickname_map.get(uid), alias)
     return {"total": count_usage_rows(realm), "rows": rows[-limit:]}
-POOL = None
+_REQUEST_RUNTIME = contextvars.ContextVar("wb_request_runtime", default=None)
+_LEGACY_POOL = None
+_LEGACY_ACCOUNTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts")
+_LEGACY_USAGE_DIR = USAGE_DIR
+_LEGACY_USAGE_LOG = USAGE_LOG
+_LEGACY_USAGE_SUMMARY = USAGE_SUMMARY
+
+class _TenantPoolProxy:
+    def _value(self):
+        runtime = _REQUEST_RUNTIME.get()
+        return runtime.pool if runtime is not None else _LEGACY_POOL
+    def __bool__(self): return self._value() is not None
+    def __getattr__(self, name):
+        value = self._value()
+        if value is None: raise AttributeError(name)
+        return getattr(value, name)
+    def __iter__(self):
+        value = self._value()
+        return iter(value.accounts if value is not None else ())
+
+class _TenantSchedulerProxy:
+    def _value(self):
+        runtime = _REQUEST_RUNTIME.get()
+        return runtime.scheduler if runtime is not None else SCHEDULER
+    def __bool__(self): return self._value() is not None
+    def __getattr__(self, name):
+        value = self._value()
+        if value is None: raise AttributeError(name)
+        return getattr(value, name)
+
+class _TenantPathProxy:
+    def __init__(self, legacy_name, attr): self.legacy_name, self.attr = legacy_name, attr
+    def _value(self):
+        runtime = _REQUEST_RUNTIME.get()
+        if runtime is not None: return getattr(runtime, self.attr)
+        return globals()[self.legacy_name]
+    def __fspath__(self): return self._value()
+    def __str__(self): return self._value()
+    def __repr__(self): return repr(self._value())
+    def __bool__(self): return bool(self._value())
+
+POOL = _TenantPoolProxy()
 SCHEDULER = None
-ACCOUNTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'accounts')
-REALM_STATE_FILE = os.path.join(ACCOUNTS_DIR, "active_realm.json")
+TENANT_SCHEDULER = _TenantSchedulerProxy()
+ACCOUNTS_DIR = _TenantPathProxy("_LEGACY_ACCOUNTS_DIR", "root")
+USAGE_DIR = _TenantPathProxy("_LEGACY_USAGE_DIR", "usage")
+USAGE_LOG = _TenantPathProxy("_LEGACY_USAGE_LOG", "usage_log")
+USAGE_SUMMARY = _TenantPathProxy("_LEGACY_USAGE_SUMMARY", "usage_summary")
+REALM_STATE_FILE = os.path.join(_LEGACY_ACCOUNTS_DIR, "active_realm.json")
 def load_persisted_realm():
     global CURRENT_REALM
     if os.path.isfile(REALM_STATE_FILE):
@@ -3662,10 +3722,15 @@ class Handler(BaseHTTPRequestHandler):
             return ""
     def _key_ok(self):
         """True when the request carries a right key (or no key is needed)."""
+        supplied = self._supplied_key()
+        self.key_entry = None
+        self.tenant_runtime = None
         # An authenticated panel session also unlocks the management APIs,
         # so the browser never has to keep the API key in localStorage.
         if self._panel_ok():
             self.principal = wb_auth.create_local_admin_session({"session_id": self._panel_token()})
+            _REQUEST_RUNTIME.set(None)
+            wb_patch_set_key(None)
             return True
         self.principal = _oauth_principal(self)
         if self.principal and self.principal.principal_type == "aac-user":
@@ -3673,11 +3738,26 @@ class Handler(BaseHTTPRequestHandler):
                 self.tenant_runtime = TENANT_MANAGER.get_or_create(self.principal.aac_user_id, self.principal.workbuddy_user_id) if TENANT_MANAGER else None
             except Exception:
                 self.tenant_runtime = None
-            supplied = self._supplied_key()
+            _REQUEST_RUNTIME.set(self.tenant_runtime)
             scoped = wb_settings.resolve_api_key(supplied, "workbuddy2api-hub", tenant_dir=self.tenant_runtime.root if self.tenant_runtime else None) if supplied and self.tenant_runtime else None
-            self.key_entry = scoped or None
-            return True
-        self.key_entry = identify_key(self._supplied_key())
+            self.key_entry = dict(scoped.__dict__) if scoped is not None else None
+            wb_patch_set_key(self.key_entry)
+            return self.tenant_runtime is not None
+        # Standalone user keys carry their own tenant identity. Resolve them
+        # before falling back to the legacy launcher key.
+        if supplied and TENANT_MANAGER:
+            self.tenant_runtime = TENANT_MANAGER.resolve_api_key_tenant(supplied)
+            if self.tenant_runtime is not None:
+                scoped = wb_settings.resolve_api_key(supplied, "workbuddy2api-hub", tenant_dir=self.tenant_runtime.root)
+                self.key_entry = dict(scoped.__dict__) if scoped is not None else None
+                if self.key_entry:
+                    self.principal = self.key_entry
+                    _REQUEST_RUNTIME.set(self.tenant_runtime)
+                    wb_patch_set_key(self.key_entry)
+                    return True
+        _REQUEST_RUNTIME.set(None)
+        self.principal = self.principal if self.principal and self.principal.principal_type != "anonymous" else None
+        self.key_entry = identify_key(supplied)
         # PATCH(wb-hub-usage-key) 记下调用方身份，供 record_usage / record_error 写入流水
         wb_patch_set_key(self.key_entry)
         if self.key_entry:
@@ -3763,7 +3843,16 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/logs"):
             return True
         return False
+    def _begin_request(self):
+        """Clear request-scoped identity before reusing a keep-alive handler."""
+        _REQUEST_RUNTIME.set(None)
+        self.key_entry = None
+        self.principal = None
+        self.tenant_runtime = None
+        wb_patch_set_key(None)
+
     def do_OPTIONS(self):
+        self._begin_request()
         self.send_response(204)
         if cors_origin_allowed(self.path):
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -3772,6 +3861,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
     def do_GET(self):
+        self._begin_request()
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
@@ -4023,7 +4113,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/scheduler":
             if not self._authorized():
                 return
-            return self._json(200, SCHEDULER.status() if SCHEDULER else {"enabled": False, "msg": "未运行"})
+            return self._json(200, TENANT_SCHEDULER.status() if TENANT_SCHEDULER else {"enabled": False, "msg": "未运行"})
         if path == "/settings":
             if not self._authorized():
                 return
@@ -4211,9 +4301,9 @@ class Handler(BaseHTTPRequestHandler):
             _WB_PATCH_ALIAS_CACHE["data"] = {}
             reply["account_aliases_saved"] = saved
         if payload.get("restart_scheduler"):
-            if SCHEDULER:
-                SCHEDULER.stop()
-                SCHEDULER.start()
+            if TENANT_SCHEDULER:
+                TENANT_SCHEDULER.stop()
+                TENANT_SCHEDULER.start()
             reply["scheduler"] = "restarted"
         reply.update(runtime_settings_view())
         return self._json(200, reply)
@@ -4357,14 +4447,14 @@ class Handler(BaseHTTPRequestHandler):
                 "accounts_count": len(targets)
             })
         if path == "/scheduler/trigger":
-            if SCHEDULER:
-                return self._json(200, SCHEDULER.trigger_now())
+            if TENANT_SCHEDULER:
+                return self._json(200, TENANT_SCHEDULER.trigger_now())
             return self._json(200, {"ok": False, "msg": "调度器未初始化"})
         if path == "/scheduler/toggle":
-            if SCHEDULER:
-                SCHEDULER.enabled = not SCHEDULER.enabled
-                SCHEDULER.log(f"用户切换调度器状态为: {'启用' if SCHEDULER.enabled else '暂停'}")
-                return self._json(200, SCHEDULER.status())
+            if TENANT_SCHEDULER:
+                TENANT_SCHEDULER.enabled = not TENANT_SCHEDULER.enabled
+                TENANT_SCHEDULER.log(f"用户切换调度器状态为: {'启用' if TENANT_SCHEDULER.enabled else '暂停'}")
+                return self._json(200, TENANT_SCHEDULER.status())
             return self._json(200, {"ok": False, "msg": "调度器未初始化"})
         if path == "/logs/clear":
             clear_logs()
@@ -4609,6 +4699,7 @@ class Handler(BaseHTTPRequestHandler):
                          retry_count=route["retry_count"], failover=route["failover"])
             return self._json(200, result)
     def do_POST(self):
+        self._begin_request()
         path = self.path.split("?")[0]
         if path == "/settings/save":
             if not self._panel_ok():
@@ -4772,7 +4863,7 @@ class Handler(BaseHTTPRequestHandler):
                          retry_count=route["retry_count"], failover=route["failover"])
             return self._json(200, result)
 def main():
-    global POOL, ACCOUNTS_DIR, API_KEY, SYSTEM_PROMPT, USAGE_DIR, USAGE_LOG, USAGE_SUMMARY, WB_AUTH_CONFIG, TENANT_MANAGER
+    global _LEGACY_POOL, _LEGACY_ACCOUNTS_DIR, API_KEY, SYSTEM_PROMPT, _LEGACY_USAGE_DIR, _LEGACY_USAGE_LOG, _LEGACY_USAGE_SUMMARY, WB_AUTH_CONFIG, TENANT_MANAGER
     WB_AUTH_CONFIG = wb_settings.oauth_config()
     TENANT_MANAGER = wb_tenants.TenantRuntimeManager(os.environ.get("WB_DATA_ROOT") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
     API_KEY_GENERATED = False
@@ -4807,9 +4898,9 @@ def main():
         wb_accounts.USER_AGENT = args.user_agent.strip()
         log("user-agent : %s (override)" % wb_accounts.USER_AGENT)
     if args.usage_dir:
-        USAGE_DIR = os.path.abspath(args.usage_dir)
-        USAGE_LOG = os.path.join(USAGE_DIR, "usage.jsonl")
-        USAGE_SUMMARY = os.path.join(USAGE_DIR, "usage-summary.json")
+        _LEGACY_USAGE_DIR = os.path.abspath(args.usage_dir)
+        _LEGACY_USAGE_LOG = os.path.join(_LEGACY_USAGE_DIR, "usage.jsonl")
+        _LEGACY_USAGE_SUMMARY = os.path.join(_LEGACY_USAGE_DIR, "usage-summary.json")
     # Refuse to start a second copy. On Windows SO_REUSEADDR lets two sockets
     # bind the same port, which silently splits incoming connections between
     # them - confusing and hard to diagnose.
@@ -4832,7 +4923,7 @@ def main():
     API_KEY = args.api_key
     SYSTEM_PROMPT = args.system_prompt
     if args.accounts_dir:
-        ACCOUNTS_DIR = os.path.abspath(args.accounts_dir)
+        _LEGACY_ACCOUNTS_DIR = os.path.abspath(args.accounts_dir)
     # LAN mode must not ship a known key: the gateway spends the account's own
     # upstream quota, so a guessable default lets anyone on the network drain
     # it. Generate one on first use, persist it, and reuse it afterwards.
@@ -4851,12 +4942,12 @@ def main():
         log("panel      : password set from --panel-password")
     elif wb_settings.panel_password_is_default(ACCOUNTS_DIR):
         log("panel      : password is still the default 'admin' - change it in the panel")
-    POOL = wb_accounts.AccountPool(ACCOUNTS_DIR, log=log)
-    POOL.load()
+    _LEGACY_POOL = wb_accounts.AccountPool(_LEGACY_ACCOUNTS_DIR, log=log)
+    _LEGACY_POOL.load()
     load_persisted_realm()
     global SCHEDULER
     from wb_scheduler import Scheduler
-    SCHEDULER = Scheduler(POOL)
+    SCHEDULER = Scheduler(_LEGACY_POOL)
     SCHEDULER.start()
     if args.info:
         account = POOL.import_desktop_credential(args.info, source="file")
