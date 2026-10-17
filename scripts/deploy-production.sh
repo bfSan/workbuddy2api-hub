@@ -67,9 +67,14 @@ if [[ "${DEPLOY_REMOTE_MODE:-0}" == "1" ]]; then
     local panel_password
     panel_password="$(cat "$PANEL_PASSWORD_FILE")"
 
+    # The production host uses rootless Podman with macOS shared mounts.
+    # Container user `wb` has no matching host UID on those mounts; root in
+    # the rootless namespace maps to the owning host user and can create the
+    # tenant data directory without changing host permissions.
     "$PODMAN_BIN" run -d \
       --name "$CONTAINER_NAME" \
       --restart unless-stopped \
+      --user 0 \
       -p "0.0.0.0:$HOST_PORT:$HOST_PORT" \
       -v "$ACCOUNTS_DIR_REMOTE:/app/accounts" \
       -v "$USAGE_DIR_REMOTE:/app/usage" \
