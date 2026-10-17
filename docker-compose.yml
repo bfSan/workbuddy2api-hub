@@ -11,7 +11,14 @@ services:
       - PORT=8788
       # - API_KEY=your_api_key_here
       - TZ=Asia/Shanghai
+      - AAC_BASE_URL=${AAC_BASE_URL:-}
+      - AAC_CLIENT_ID=${AAC_CLIENT_ID:-workbuddy2api-hub}
+      - AAC_REDIRECT_URI=${AAC_REDIRECT_URI:-}
+      - WB_DATA_ROOT=/app/data
+      - WB_AUTH_MODE=${WB_AUTH_MODE:-hybrid}
+      - WB_INSTANCE_KEY_FILE=${WB_INSTANCE_KEY_FILE:-/app/data/instance.key}
     volumes:
       # 持久化挂载账号凭证与用量流水
       - ./accounts:/app/accounts
       - ./usage:/app/usage
+      - ./data:/app/data
