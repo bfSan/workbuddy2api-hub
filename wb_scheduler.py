@@ -173,3 +173,22 @@ class Scheduler:
             "next_run_time": self.next_run_time or "待调度",
             "logs": self.logs[-20:],
         }
+
+class SchedulerError(Exception):
+    pass
+
+class TenantScheduler:
+    def run_once(self, tenant_runtime, owner_user_id, auth_snapshot):
+        actual = str(getattr(tenant_runtime, "workbuddy_user_id", ""))
+        if actual != str(owner_user_id):
+            raise SchedulerError("WB_TENANT_FORBIDDEN")
+        return {"ok": True, "owner_user_id": actual, "auth_snapshot": dict(auth_snapshot or {})}
+
+class InstanceScheduler:
+    def __init__(self):
+        self.tenants = {}
+    def register_tenant(self, tenant_runtime):
+        owner = str(getattr(tenant_runtime, "workbuddy_user_id", ""))
+        if not owner: raise SchedulerError("owner_user_id is required")
+        self.tenants[owner] = TenantScheduler()
+        return owner
