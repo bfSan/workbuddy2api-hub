@@ -401,3 +401,67 @@ def oauth_config(env=None):
         "redirect_uri": str(env.get("AAC_REDIRECT_URI") or ""),
         "auth_mode": str(env.get("WB_AUTH_MODE") or "hybrid").strip().lower(),
     }
+
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class KeyPrincipal:
+    key_id: str
+    owner_user_id: str
+    app_id: str
+    scope: str
+    label: str = ""
+    expires_at: float = 0.0
+    last_used_at: float = 0.0
+    principal_type: str = "api-key"
+    role: str = "user"
+
+class AuthzError(Exception):
+    def __init__(self, code="WB_TENANT_FORBIDDEN", message=None, status=403):
+        self.code = code; self.status = status
+        super().__init__(message or code)
+
+def _key_file(tenant_dir):
+    return os.path.join(tenant_dir, ".api-keys.json")
+
+def issue_user_api_key(tenant_dir, owner_user_id, label, expires_at=None):
+    os.makedirs(tenant_dir, mode=0o700, exist_ok=True)
+    credential = "wbk_" + secrets.token_urlsafe(32)
+    now = time.time()
+    record = {"key_id": secrets.token_hex(12), "owner_user_id": str(owner_user_id), "app_id": "workbuddy2api-hub", "scope": "user", "key_hash": hashlib.sha256(credential.encode()).hexdigest(), "label": str(label or "").strip()[:120], "enabled": True, "expires_at": float(expires_at or now + 365*24*3600), "last_used_at": 0.0}
+    records = _load_key_records(tenant_dir); records.append(record); _save_key_records(tenant_dir, records)
+    metadata = dict(record); metadata.pop("key_hash", None)
+    return {"credential": credential, "metadata": metadata}
+
+def resolve_api_key(credential, app_id, now=None, tenant_dir=None):
+    credential = str(credential or "").strip()
+    if not credential: return None
+    digest = hashlib.sha256(credential.encode()).hexdigest(); now = float(time.time() if now is None else now)
+    dirs = [tenant_dir] if tenant_dir else []
+    for directory in dirs:
+        for record in _load_key_records(directory):
+            if record.get("app_id") != app_id or not record.get("enabled") or float(record.get("expires_at") or 0) <= now: continue
+            if hmac.compare_digest(str(record.get("key_hash") or ""), digest):
+                return KeyPrincipal(str(record.get("key_id")), str(record.get("owner_user_id")), str(record.get("app_id")), str(record.get("scope") or "user"), str(record.get("label") or ""), float(record.get("expires_at") or 0), float(record.get("last_used_at") or 0), "api-key", "admin" if record.get("scope") == "app" else "user")
+    return None
+
+def authorize_route(principal, route, method, *, resource_owner_id=None):
+    if principal is None: raise AuthzError("WB_AUTH_REQUIRED")
+    if getattr(principal, "principal_type", "") == "local-admin": return None
+    role = getattr(principal, "role", "user")
+    if resource_owner_id and role != "admin" and str(resource_owner_id) != str(getattr(principal, "workbuddy_user_id", "")):
+        raise AuthzError()
+    if route in ("settings", "scheduler", "tasks") and role != "admin" and method not in ("GET", "HEAD"):
+        raise AuthzError("WB_WORKBUDDY_ADMIN_REQUIRED")
+    return None
+
+def _load_key_records(tenant_dir):
+    try:
+        with open(_key_file(tenant_dir), encoding="utf-8") as fh: data=json.load(fh)
+        return data if isinstance(data,list) else []
+    except (FileNotFoundError, ValueError, OSError): return []
+
+def _save_key_records(tenant_dir, records):
+    path=_key_file(tenant_dir); tmp=path+".tmp"
+    with open(tmp,"w",encoding="utf-8") as fh: json.dump(records,fh,ensure_ascii=False,indent=2); fh.write("\n")
+    os.chmod(tmp,0o600); os.replace(tmp,path)
