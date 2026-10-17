@@ -247,7 +247,7 @@ export OPENAI_API_KEY="你在看板设置中添加并绑定的API_Key"
 
 ## AAC OAuth 与租户隔离
 
-WorkBuddy 支持 `AAC_BASE_URL`、`AAC_CLIENT_ID`、`AAC_REDIRECT_URI` 和 `WB_AUTH_MODE=hybrid`。OAuth 用户通过 `/auth/login` 进入 AAC，WorkBuddy 只保存短期本地会话；本地 `/panel/*` 管理员入口继续保留。租户数据放在 `WB_DATA_ROOT/tenants/<aac-user-id>`，旧账号迁移必须显式执行：
+WorkBuddy 支持 `AAC_BASE_URL`、`AAC_PUBLIC_BASE_URL`、`AAC_CLIENT_ID`、`AAC_REDIRECT_URI` 和 `WB_AUTH_MODE=hybrid`。容器内 token/introspection 请求使用 `AAC_BASE_URL`，浏览器跳转使用 `AAC_PUBLIC_BASE_URL`；生产 Podman 默认分别为 `http://host.containers.internal:17345` 和 `http://10.88.86.106:17345`。OAuth 用户通过 `/auth/login` 进入 AAC，WorkBuddy 只保存短期本地会话；本地 `/panel/*` 管理员入口继续保留。租户数据放在 `WB_DATA_ROOT/tenants/<aac-user-id>`，旧账号迁移必须显式执行：
 
 ```bash
 python scripts/migrate-legacy-tenant.py --source accounts --target data --owner-user-id <workbuddy-user-id> --dry-run

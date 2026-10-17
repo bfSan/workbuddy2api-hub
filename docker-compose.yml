@@ -12,6 +12,7 @@ services:
       # - API_KEY=your_api_key_here
       - TZ=Asia/Shanghai
       - AAC_BASE_URL=${AAC_BASE_URL:-}
+      - AAC_PUBLIC_BASE_URL=${AAC_PUBLIC_BASE_URL:-}
       - AAC_CLIENT_ID=${AAC_CLIENT_ID:-workbuddy2api-hub}
       - AAC_REDIRECT_URI=${AAC_REDIRECT_URI:-}
       - WB_DATA_ROOT=/app/data
