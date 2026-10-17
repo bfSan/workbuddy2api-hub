@@ -84,6 +84,7 @@ if [[ "${DEPLOY_REMOTE_MODE:-0}" == "1" ]]; then
       -v "$USAGE_DIR_REMOTE:/app/usage" \
       -v "$TENANT_DATA_REMOTE:/app/data" \
       -e AAC_BASE_URL="$AAC_BASE_URL_EFFECTIVE" \
+      -e AAC_PUBLIC_BASE_URL="${AAC_PUBLIC_BASE_URL:-http://10.88.86.106:17345}" \
       -e AAC_CLIENT_ID="${AAC_CLIENT_ID:-workbuddy2api-hub}" \
       -e AAC_REDIRECT_URI="${AAC_REDIRECT_URI:-}" \
       -e WB_DATA_ROOT=/app/data \

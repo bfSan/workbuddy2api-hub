@@ -3874,7 +3874,7 @@ class Handler(BaseHTTPRequestHandler):
             challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
             with OAUTH_LOCK:
                 OAUTH_TRANSACTIONS[state] = {"verifier": verifier, "created_at": time.time()}
-            location = wb_auth.build_authorize_url(WB_AUTH_CONFIG["aac_base_url"], WB_AUTH_CONFIG["client_id"], WB_AUTH_CONFIG["redirect_uri"], state, challenge)
+            location = wb_auth.build_authorize_url(WB_AUTH_CONFIG["aac_public_base_url"], WB_AUTH_CONFIG["client_id"], WB_AUTH_CONFIG["redirect_uri"], state, challenge)
             self.send_response(302)
             self.send_header("Location", location)
             self.send_header("Cache-Control", "no-store")
