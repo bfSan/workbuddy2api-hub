@@ -237,7 +237,8 @@ a:hover{text-decoration:underline}
            style="width:100%;background:var(--panel2);border:1px solid var(--line);
                   border-radius:8px;padding:9px 12px;color:var(--fg);font:inherit">
     <div id="panelLoginMsg" style="font-size:12px;color:var(--bad);min-height:17px;margin:8px 0 12px"></div>
-    <button onclick="submitPanelLogin()" style="width:100%;padding:9px 12px;font-size:13px">进入面板</button>
+    <button onclick="submitPanelLogin()" style="width:100%;padding:9px 12px;font-size:13px">本地管理员登录</button>
+    <button class="sec" onclick="oauthLogin()" style="width:100%;padding:9px 12px;font-size:13px;margin-top:8px">使用 AAC 登录</button>
     <div id="panelDefaultHint" style="display:none;font-size:11px;color:var(--warn);margin-top:12px">
       当前仍在使用默认密码 <b>admin</b>，登录后请在「设置」中修改。
     </div>
@@ -2527,7 +2528,20 @@ async function panelLogout(){
   location.reload();
 }
 
+async function oauthLogin(){
+  location.href = '/auth/login';
+}
+
 async function bootPanel(){
+  try {
+    const oauth = await fetch('/auth/me', {cache: 'no-store'});
+    const me = await oauth.json().catch(() => ({}));
+    if(me.authenticated){
+      panelHideGate();
+      await startDashboard();
+      return;
+    }
+  } catch(e) {}
   try {
     const r = await fetch('/panel/status', {cache: 'no-store', headers: authHeaders()});
     PANEL_STATUS = await r.json().catch(() => ({}));

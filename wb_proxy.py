@@ -31,6 +31,7 @@ import wb_catalog
 import wb_model_registry
 import wb_routing
 import wb_settings
+import wb_auth
 CURRENT_REALM = os.environ.get("WB_PROXY_DEFAULT_REALM", "intl")
 def detect_model_realm(model_id):
     if not model_id:
@@ -173,6 +174,9 @@ USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "reasoning_tokens",
 # "admin"), independent of the /v1 API key. Sessions live in memory only, so a
 # restart forces browsers to log in again.
 PANEL = wb_settings.PanelSessions()
+OAUTH_TRANSACTIONS = {}
+OAUTH_LOCK = threading.RLock()
+WB_AUTH_CONFIG = wb_settings.oauth_config()
 API_KEY_FILE_SET = False
 def configured_keys():
     """Panel-managed API keys, always read fresh so panel edits apply at once."""
@@ -3566,11 +3570,33 @@ def stream_responses_events(upstream, model, holder):
 # ---------------------------------------------------------------------------
 # HTTP layer
 # ---------------------------------------------------------------------------
+def _cookie_map(header):
+    result = {}
+    for chunk in str(header or "").split(";"):
+        if "=" in chunk:
+            key, value = chunk.split("=", 1)
+            result[key.strip()] = value.strip()
+    return result
+
+def _oauth_cookie_headers(session_id):
+    return {"Set-Cookie": "WB-Session=%s; Path=/; HttpOnly; SameSite=Lax" % session_id, "Cache-Control": "no-store"}
+
+def _oauth_principal(handler):
+    try:
+        cookies = _cookie_map(handler.headers.get("Cookie"))
+        return wb_auth.resolve_principal(dict(handler.headers), cookies, wb_auth._sessions)
+    except wb_auth.AuthError:
+        return None
+
+def _oauth_enabled():
+    return bool(WB_AUTH_CONFIG.get("aac_base_url") and WB_AUTH_CONFIG.get("redirect_uri"))
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     # Which configured API key the caller used, set by _key_ok(). Its bound
     # realm decides the upstream exit for this request alone.
     key_entry = None
+    principal = None
     def handle(self):
         try:
             super().handle()
@@ -3630,6 +3656,11 @@ class Handler(BaseHTTPRequestHandler):
         # An authenticated panel session also unlocks the management APIs,
         # so the browser never has to keep the API key in localStorage.
         if self._panel_ok():
+            self.principal = wb_auth.create_local_admin_session({"session_id": self._panel_token()})
+            return True
+        self.principal = _oauth_principal(self)
+        if self.principal and self.principal.principal_type == "aac-user":
+            self.key_entry = None
             return True
         self.key_entry = identify_key(self._supplied_key())
         # PATCH(wb-hub-usage-key) 记下调用方身份，供 record_usage / record_error 写入流水
@@ -3695,6 +3726,8 @@ class Handler(BaseHTTPRequestHandler):
         return token
     def _panel_ok(self):
         return PANEL.valid(self._panel_token())
+    def _management_ok(self):
+        return self._panel_ok() or _oauth_principal(self) is not None
     @staticmethod
     def _is_panel_route(path):
         """Management endpoints shown in the web panel.
@@ -3724,7 +3757,57 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
-        if self._is_panel_route(path) and not self._panel_ok():
+        if path == "/auth/login":
+            if not _oauth_enabled():
+                return self._error(503, "AAC OAuth is not configured", "configuration_error")
+            state = secrets.token_urlsafe(24)
+            verifier = secrets.token_urlsafe(32)
+            challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+            with OAUTH_LOCK:
+                OAUTH_TRANSACTIONS[state] = {"verifier": verifier, "created_at": time.time()}
+            location = wb_auth.build_authorize_url(WB_AUTH_CONFIG["aac_base_url"], WB_AUTH_CONFIG["client_id"], WB_AUTH_CONFIG["redirect_uri"], state, challenge)
+            self.send_response(302)
+            self.send_header("Location", location)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/auth/callback":
+            state = (query.get("state") or [""])[0]
+            code = (query.get("code") or [""])[0]
+            with OAUTH_LOCK:
+                transaction = OAUTH_TRANSACTIONS.pop(state, None)
+            if not transaction or time.time() - transaction["created_at"] > 300 or not code:
+                return self._error(400, "invalid OAuth state", "invalid_request_error")
+            try:
+                token = wb_auth.exchange_code(WB_AUTH_CONFIG["aac_base_url"], WB_AUTH_CONFIG["client_id"], WB_AUTH_CONFIG["redirect_uri"], code, transaction["verifier"])
+                claims = wb_auth.introspect_access_token(WB_AUTH_CONFIG["aac_base_url"], token.get("access_token"), WB_AUTH_CONFIG["client_id"])
+                session = wb_auth.create_oauth_session(claims)
+            except wb_auth.AuthError as exc:
+                return self._error(exc.status, str(exc), "invalid_request_error")
+            self.send_response(302)
+            self.send_header("Location", "/")
+            for key, value in _oauth_cookie_headers(session["session_id"]).items(): self.send_header(key, value)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/auth/me":
+            principal = _oauth_principal(self)
+            if not principal:
+                return self._json(200, {"authenticated": False})
+            return self._json(200, {"authenticated": True, "principal": principal.as_dict()})
+        if path == "/auth/logout":
+            cookies = _cookie_map(self.headers.get("Cookie"))
+            sid = cookies.get("WB-Session")
+            if sid:
+                wb_auth._sessions.pop(sid, None)
+            self.send_response(302)
+            self.send_header("Location", "/")
+            self.send_header("Set-Cookie", "WB-Session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self._is_panel_route(path) and not self._management_ok():
             return self._error(401, "panel password required", "invalid_request_error")
         if path in ("/", "/dashboard", "/ui"):
             return self._dashboard()
@@ -4525,7 +4608,7 @@ class Handler(BaseHTTPRequestHandler):
                                    "upstream_error")
         if path in ("/panel/login", "/panel/logout", "/panel/password"):
             return self._handle_panel(path)
-        if self._is_panel_route(path) and not self._panel_ok():
+        if self._is_panel_route(path) and not self._management_ok():
             return self._error(401, "panel password required", "invalid_request_error")
         is_account_route = (
             path.startswith("/accounts/")
@@ -4667,7 +4750,8 @@ class Handler(BaseHTTPRequestHandler):
                          retry_count=route["retry_count"], failover=route["failover"])
             return self._json(200, result)
 def main():
-    global POOL, ACCOUNTS_DIR, API_KEY, SYSTEM_PROMPT, USAGE_DIR, USAGE_LOG, USAGE_SUMMARY
+    global POOL, ACCOUNTS_DIR, API_KEY, SYSTEM_PROMPT, USAGE_DIR, USAGE_LOG, USAGE_SUMMARY, WB_AUTH_CONFIG
+    WB_AUTH_CONFIG = wb_settings.oauth_config()
     API_KEY_GENERATED = False
     ap = argparse.ArgumentParser(description="WorkBuddy (workbuddy.ai) -> OpenAI-compatible proxy")
     ap.add_argument("--info", help="path to the WorkBuddy *.info credential file")

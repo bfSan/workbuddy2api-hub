@@ -391,3 +391,13 @@ def set_account_aliases(accounts_dir, mapping):
     data["account_aliases"] = out
     save(accounts_dir, data)
     return out
+
+
+def oauth_config(env=None):
+    env = env or os.environ
+    return {
+        "aac_base_url": str(env.get("AAC_BASE_URL") or "").rstrip("/"),
+        "client_id": str(env.get("AAC_CLIENT_ID") or "workbuddy2api-hub"),
+        "redirect_uri": str(env.get("AAC_REDIRECT_URI") or ""),
+        "auth_mode": str(env.get("WB_AUTH_MODE") or "hybrid").strip().lower(),
+    }
