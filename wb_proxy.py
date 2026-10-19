@@ -3874,6 +3874,17 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         query = parse_qs(parsed.query)
         if path == "/auth/login":
+            # AAC menu links point here. Reusing the link while an OAuth
+            # session is still valid should keep the user in WorkBuddy
+            # instead of starting another authorization flow.
+            principal = _oauth_principal(self)
+            if principal and principal.principal_type == "aac-user":
+                self.send_response(302)
+                self.send_header("Location", "/")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if not _oauth_enabled():
                 return self._error(503, "AAC OAuth is not configured", "configuration_error")
             state = secrets.token_urlsafe(24)
@@ -3909,7 +3920,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/auth/me":
             principal = _oauth_principal(self)
-            if not principal:
+            if not principal or principal.principal_type == "anonymous":
                 return self._json(200, {"authenticated": False})
             return self._json(200, {"authenticated": True, "principal": principal.as_dict()})
         if path == "/auth/logout":
@@ -3925,7 +3936,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self._is_panel_route(path) and not self._management_ok() and not _oauth_principal(self):
             return self._error(401, "panel password required", "invalid_request_error")
-        if path in ("/scheduler", "/tasks", "/logs") and self._oauth_role() == "user":
+        if path in ("/scheduler", "/logs") and self._oauth_role() == "user":
             return self._error(403, "WorkBuddy admin required", "invalid_request_error")
         if path in ("/", "/dashboard", "/ui"):
             return self._dashboard()
@@ -4742,7 +4753,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_panel(path)
         if self._is_panel_route(path) and not self._management_ok() and not _oauth_principal(self):
             return self._error(401, "panel password required", "invalid_request_error")
-        if (path.startswith("/scheduler") or path.startswith("/tasks") or path.startswith("/logs")) and self._oauth_role() == "user":
+        if (path.startswith("/scheduler") or path.startswith("/logs")) and self._oauth_role() == "user":
             return self._error(403, "WorkBuddy admin required", "invalid_request_error")
         is_account_route = (
             path.startswith("/accounts/")
