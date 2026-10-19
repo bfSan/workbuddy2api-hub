@@ -3658,6 +3658,11 @@ def _oauth_principal(handler):
     except wb_auth.AuthError:
         return None
 
+def _aac_session_present(handler):
+    """Whether the request explicitly carries an AAC-backed session."""
+    cookies = _cookie_map(handler.headers.get("Cookie"))
+    return bool(cookies.get("WB-Session") or handler.headers.get("X-WB-Session"))
+
 def _oauth_enabled():
     return bool(WB_AUTH_CONFIG.get("aac_base_url") and WB_AUTH_CONFIG.get("redirect_uri"))
 
@@ -3727,13 +3732,6 @@ class Handler(BaseHTTPRequestHandler):
         supplied = self._supplied_key()
         self.key_entry = None
         self.tenant_runtime = None
-        # An authenticated panel session also unlocks the management APIs,
-        # so the browser never has to keep the API key in localStorage.
-        if self._panel_ok():
-            self.principal = wb_auth.create_local_admin_session({"session_id": self._panel_token()})
-            _REQUEST_RUNTIME.set(None)
-            wb_patch_set_key(None)
-            return True
         self.principal = _oauth_principal(self)
         if self.principal and self.principal.principal_type == "aac-user":
             # AAC administrators operate the legacy/global workspace.  Only
@@ -3751,6 +3749,21 @@ class Handler(BaseHTTPRequestHandler):
             self.key_entry = dict(scoped.__dict__) if scoped is not None else None
             wb_patch_set_key(self.key_entry)
             return self.tenant_runtime is not None
+        # Do not fall back to a stale local panel token when an AAC session was
+        # supplied but failed validation; that would turn an expired AAC login
+        # into an unrelated global-admin session.
+        if _aac_session_present(self):
+            _REQUEST_RUNTIME.set(None)
+            wb_patch_set_key(None)
+            return False
+        # A local panel session is only an identity fallback when no AAC user
+        # session is present. This prevents a stale browser panel token from
+        # overriding the tenant selected by an ordinary AAC login.
+        if self._panel_ok():
+            self.principal = wb_auth.create_local_admin_session({"session_id": self._panel_token()})
+            _REQUEST_RUNTIME.set(None)
+            wb_patch_set_key(None)
+            return True
         # Standalone user keys carry their own tenant identity. Resolve them
         # before falling back to the legacy launcher key.
         if supplied and TENANT_MANAGER:
@@ -3831,7 +3844,11 @@ class Handler(BaseHTTPRequestHandler):
         return PANEL.valid(self._panel_token())
     def _management_ok(self):
         principal = _oauth_principal(self)
-        return self._panel_ok() or bool(principal and getattr(principal, "role", "") == "admin")
+        if principal and principal.principal_type == "aac-user":
+            return getattr(principal, "role", "") == "admin"
+        if _aac_session_present(self):
+            return False
+        return self._panel_ok()
     def _oauth_role(self):
         principal = _oauth_principal(self)
         return getattr(principal, "role", "") if principal else ""

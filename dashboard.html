@@ -2541,6 +2541,10 @@ async function bootPanel(){
     const me = await oauth.json().catch(() => ({}));
     if(me.authenticated){
       AAC_ROLE = (me.principal && me.principal.role) || 'user';
+      // AAC identity is authoritative for this browser. Drop any stale local
+      // panel token so it cannot influence the UI or subsequent requests.
+      PANEL_TOKEN = '';
+      try { sessionStorage.removeItem(PANEL_STORE); } catch(e) {}
       applyRoleUI();
       panelHideGate();
       await startDashboard();
@@ -2601,7 +2605,9 @@ async function startDashboard(){
 }
 
 function applyRoleUI(){
-  const admin = AAC_ROLE === 'admin' || !!PANEL_TOKEN;
+  // A local panel token only grants admin UI when there is no AAC identity.
+  // Once AAC login succeeds, the AAC role is the sole source of privilege.
+  const admin = AAC_ROLE === 'admin' || (!AAC_ROLE && !!PANEL_TOKEN);
   const hide = id => { const el = document.getElementById(id); if(el) el.style.display = 'none'; };
   if(!admin){
     hide('btnNavLogs'); hide('pageLogs');

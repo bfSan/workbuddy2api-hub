@@ -151,12 +151,6 @@ def resolve_principal(headers, cookies, local_state, now=None, local_sessions=No
     now = float(time.time() if now is None else now)
     cookies = cookies or {}
     local_sessions = local_sessions if local_sessions is not None else _local_sessions
-    panel_id = cookies.get("WB-Panel-Session") or headers.get("X-Panel-Session")
-    if panel_id:
-        session = local_sessions.get(panel_id)
-        if session and float(session.get("expires_at", 0)) > now:
-            return _principal_from_session(session)
-        raise AuthError("WB_SESSION_EXPIRED")
     session_id = cookies.get("WB-Session") or headers.get("X-WB-Session")
     if session_id:
         store = local_state if isinstance(local_state, dict) and session_id in local_state else _sessions
@@ -164,6 +158,16 @@ def resolve_principal(headers, cookies, local_state, now=None, local_sessions=No
         if not session or float(session.get("expires_at", 0)) <= now:
             raise AuthError("WB_SESSION_EXPIRED")
         return _principal_from_session(session)
+    # Prefer the AAC session when both cookies are present. A browser can keep
+    # an older local panel session while signing in through AAC; allowing that
+    # stale local session to win would silently elevate an ordinary AAC user
+    # into the global admin workspace.
+    panel_id = cookies.get("WB-Panel-Session") or headers.get("X-Panel-Session")
+    if panel_id:
+        session = local_sessions.get(panel_id)
+        if session and float(session.get("expires_at", 0)) > now:
+            return _principal_from_session(session)
+        raise AuthError("WB_SESSION_EXPIRED")
     return PrincipalContext("anonymous", "", "", "", "none", (), "", now)
 
 
