@@ -452,7 +452,7 @@ def authorize_route(principal, route, method, *, resource_owner_id=None):
     role = getattr(principal, "role", "user")
     if resource_owner_id and role != "admin" and str(resource_owner_id) != str(getattr(principal, "workbuddy_user_id", "")):
         raise AuthzError()
-    if route in ("settings", "scheduler", "tasks") and role != "admin" and method not in ("GET", "HEAD"):
+    if route in ("settings", "scheduler", "realm") and role != "admin" and method not in ("GET", "HEAD"):
         raise AuthzError("WB_WORKBUDDY_ADMIN_REQUIRED")
     return None
 

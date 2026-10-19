@@ -3653,7 +3653,8 @@ def _oauth_cookie_headers(session_id):
 def _oauth_principal(handler):
     try:
         cookies = _cookie_map(handler.headers.get("Cookie"))
-        return wb_auth.resolve_principal(dict(handler.headers), cookies, wb_auth._sessions)
+        principal = wb_auth.resolve_principal(dict(handler.headers), cookies, wb_auth._sessions)
+        return None if principal.principal_type == "anonymous" else principal
     except wb_auth.AuthError:
         return None
 
@@ -4159,6 +4160,8 @@ class Handler(BaseHTTPRequestHandler):
                 since_id = 0
             return self._json(200, get_logs(limit=limit, level=level, tag=tag, search=search, since_id=since_id))
         if path == "/logs/export":
+            if self._oauth_role() == "user":
+                return self._error(403, "WorkBuddy admin required", "invalid_request_error")
             if not self._authorized():
                 return
             log_data = get_logs(limit=5000)
@@ -4754,6 +4757,8 @@ class Handler(BaseHTTPRequestHandler):
         if self._is_panel_route(path) and not self._management_ok() and not _oauth_principal(self):
             return self._error(401, "panel password required", "invalid_request_error")
         if (path.startswith("/scheduler") or path.startswith("/logs")) and self._oauth_role() == "user":
+            return self._error(403, "WorkBuddy admin required", "invalid_request_error")
+        if path == "/realm" and self._oauth_role() == "user":
             return self._error(403, "WorkBuddy admin required", "invalid_request_error")
         is_account_route = (
             path.startswith("/accounts/")
