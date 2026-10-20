@@ -189,6 +189,11 @@ def configured_keys():
     except Exception as exc:
         log("could not read api keys: %s" % exc)
         return []
+
+def api_key_configured():
+    """Whether any gateway credential is configured, regardless of source."""
+    return bool(API_KEY) or bool(configured_keys())
+
 def auth_required():
     """Whether /v1 calls must present a key at all."""
     if wb_settings.auth_disabled(ACCOUNTS_DIR):
@@ -1033,7 +1038,10 @@ def runtime_settings_view():
         # PATCH(wb-hub-account-alias) 整张别名表给前端，任务页/看板都能按 uid 反查显示名
         "account_aliases": wb_patch_account_aliases(),
         "panel_password_is_default": wb_settings.panel_password_is_default(ACCOUNTS_DIR),
-        "api_key_set": bool(key),
+        # Panel-managed keys are the source of truth after the first save;
+        # checking only the launcher variable made the UI report no key and
+        # caused clients to omit Authorization before receiving a 401.
+        "api_key_set": api_key_configured(),
         "api_key_set_by_panel": API_KEY_FILE_SET,
         "api_key_masked": masked,
         "auth_required": auth_required(),
@@ -3968,7 +3976,7 @@ class Handler(BaseHTTPRequestHandler):
             }
             # Whether a key exists is not a secret; its value never leaves the
             # process, and the settings endpoint only reports a masked form.
-            info["api_key_set"] = bool(API_KEY)
+            info["api_key_set"] = api_key_configured()
             return self._json(200, info)
         if path == "/health":
             # Always answer (the launcher uses this to detect a running copy),
@@ -3980,7 +3988,7 @@ class Handler(BaseHTTPRequestHandler):
                 "realm_scope": "api routing is selected per account and model",
                 "accounts": len(POOL.accounts) if POOL else 0,
                 "accounts_ready": POOL.count_ready() if POOL else 0,
-                "api_key_required": bool(API_KEY),
+                "api_key_required": auth_required(),
             }
             if self._key_ok():
                 info.update({
