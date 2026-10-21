@@ -70,6 +70,11 @@ if [[ "${SKIP_TESTS:-0}" != "1" ]]; then
     "$VENV_DIR/bin/python" _test_account_display.py
     "$VENV_DIR/bin/python" _test_cat_travel.py
     "$VENV_DIR/bin/python" _test_unified_panel.py
+    "$VENV_DIR/bin/python" _test_api_key_scope.py
+    "$VENV_DIR/bin/python" _test_gateway_key_status.py
+    "$VENV_DIR/bin/python" _test_tenant_isolation.py
+    "$VENV_DIR/bin/python" _test_admin_aggregate.py
+    "$VENV_DIR/bin/python" _test_route_authorization.py
     # The dashboard pagination core is plain JS, so gate it whenever node is
     # around without making node a hard build dependency. The companion
     # _test_pagination_browser.py needs a downloaded browser and is not run

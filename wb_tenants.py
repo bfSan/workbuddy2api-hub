@@ -118,6 +118,29 @@ class TenantRuntimeManager:
             while len(self._cache) > self.max_cached: self._cache.pop(next(iter(self._cache)))
             return runtime
 
+    def list_runtimes(self):
+        """Return every tenant that has persisted identity metadata."""
+        runtimes = []
+        try:
+            names = sorted(os.listdir(self.tenants_root))
+        except OSError:
+            return runtimes
+        for aac_user_id in names:
+            if aac_user_id.startswith("."):
+                continue
+            root = os.path.join(self.tenants_root, aac_user_id)
+            if not os.path.isdir(root):
+                continue
+            user = TenantFileStore(os.path.join(root, "user.json"), "unknown", self.app_id).load()
+            workbuddy_user_id = str(user.get("workbuddy_user_id") or "")
+            if not workbuddy_user_id:
+                continue
+            try:
+                runtimes.append(self.get_or_create(aac_user_id, workbuddy_user_id))
+            except ValueError:
+                continue
+        return runtimes
+
     def _load_index(self):
         try:
             with open(self.index_path, encoding="utf-8") as fh:
@@ -171,19 +194,27 @@ class TenantRuntimeManager:
                 except (KeyError, ValueError, OSError):
                     pass
             # Rebuild lazily for keys created by older versions or direct API use.
-            for aac_id in os.listdir(self.tenants_root) if os.path.isdir(self.tenants_root) else []:
-                root = os.path.join(self.tenants_root, aac_id)
-                if not os.path.isdir(root): continue
-                user = TenantFileStore(os.path.join(root, "user.json"), "unknown", self.app_id).load()
-                wb_id = str(user.get("workbuddy_user_id") or "")
-                if not wb_id: continue
-                runtime = self.get_or_create(aac_id, wb_id)
+            panel_matches = []
+            for runtime in self.list_runtimes():
                 import wb_settings
                 principal = wb_settings.resolve_api_key(credential, self.app_id, tenant_dir=runtime.root)
                 if principal:
-                    index[digest] = {"aac_user_id": aac_id, "workbuddy_user_id": wb_id}
+                    index[digest] = {
+                        "aac_user_id": runtime.aac_user_id,
+                        "workbuddy_user_id": runtime.workbuddy_user_id,
+                    }
                     self._save_index(index)
                     return runtime
+                if wb_settings.match_api_key(runtime.root, credential):
+                    panel_matches.append(runtime)
+            if len(panel_matches) == 1:
+                runtime = panel_matches[0]
+                index[digest] = {
+                    "aac_user_id": runtime.aac_user_id,
+                    "workbuddy_user_id": runtime.workbuddy_user_id,
+                }
+                self._save_index(index)
+                return runtime
         return None
 
     def assert_owner(self, resource_owner_id, principal):
@@ -191,6 +222,192 @@ class TenantRuntimeManager:
         if str(resource_owner_id or "") != str(getattr(principal, "workbuddy_user_id", "")):
             raise TenantError("WB_TENANT_FORBIDDEN", "resource belongs to another tenant", 403)
         return None
+
+
+class AggregateAccountPool:
+    """Read across admin-visible pools while preserving each account's owner."""
+
+    def __init__(self, pools, log=None):
+        import wb_accounts
+        self.pools = [pool for pool in pools if pool is not None]
+        self.log = log or (lambda msg: None)
+        self.affinity = wb_accounts.SessionAffinity()
+        self._lock = threading.RLock()
+        self._cursor = 0
+        self.accounts = []
+        self._owners = {}
+        self._rebuild()
+
+    @property
+    def dir(self):
+        return self.pools[0].dir if self.pools else ""
+
+    def _rebuild(self):
+        accounts = []
+        owners = {}
+        for pool in self.pools:
+            for account in pool.accounts:
+                uid = str(account.uid or "")
+                if not uid or uid in owners:
+                    continue
+                owners[uid] = pool
+                accounts.append(account)
+        with self._lock:
+            self.accounts = accounts
+            self._owners = owners
+
+    def reload(self):
+        for pool in self.pools:
+            pool.load()
+        self._rebuild()
+
+    def list_public(self, realm=None):
+        return [a.public() for a in self.accounts if not realm or a.realm == realm]
+
+    def get(self, uid):
+        for account in self.accounts:
+            if account.uid == uid:
+                return account
+        return None
+
+    def add(self, account):
+        if not self.pools:
+            raise TenantError("WB_ACCOUNT_POOL_EMPTY", "no account pool available", 503)
+        result = self.pools[0].add(account)
+        self._rebuild()
+        return result
+
+    def remove(self, uid):
+        pool = self._owners.get(uid)
+        if pool is None:
+            return False
+        removed = pool.remove(uid)
+        self._rebuild()
+        return removed
+
+    def preview_import_rows(self, rows, realm=None, overwrite=False):
+        primary = self.pools[0].preview_import_rows(rows, realm=realm, overwrite=overwrite)
+        visible = {a.uid for a in self.accounts}
+        primary_uids = {a.uid for a in self.pools[0].accounts} if self.pools else set()
+        for uid in list(primary.get("added") or []):
+            if uid in visible and uid not in primary_uids:
+                primary["added"].remove(uid)
+                primary["skipped"].append({"uid": uid, "reason": "already exists"})
+        return primary
+
+    def import_rows(self, rows, realm=None, overwrite=False):
+        import wb_accounts
+        report = {"added": [], "updated": [], "skipped": [], "invalid": []}
+        seen = set()
+        for index, row in enumerate(rows):
+            try:
+                kwargs = wb_accounts.normalise_import_row(row, realm=realm)
+            except Exception as exc:
+                report["invalid"].append({"index": index + 1, "reason": str(exc)})
+                continue
+            uid = kwargs["uid"]
+            if uid in seen:
+                report["skipped"].append({"uid": uid, "reason": "duplicate inside the document"})
+                continue
+            seen.add(uid)
+            pool = self._owners.get(uid) or (self.pools[0] if self.pools else None)
+            if pool is None:
+                report["invalid"].append({"index": index + 1, "reason": "no account pool available"})
+                continue
+            if uid in self._owners and not overwrite:
+                report["skipped"].append({"uid": uid, "reason": "already exists"})
+                continue
+            result = pool.import_rows([row], realm=realm, overwrite=overwrite)
+            for field in report:
+                report[field].extend(result.get(field) or [])
+        self._rebuild()
+        return report
+
+    def set_enabled(self, uid, enabled):
+        pool = self._owners.get(uid)
+        return pool.set_enabled(uid, enabled) if pool is not None else None
+
+    def set_all_enabled(self, enabled, realm=None):
+        for pool in self.pools:
+            pool.set_all_enabled(enabled, realm=realm)
+
+    def refresh_account(self, account):
+        pool = self._owners.get(getattr(account, "uid", ""))
+        return pool.refresh_account(account) if pool is not None else False
+
+    def count_ready(self, realm=None):
+        return sum(1 for a in self.accounts if (not realm or a.realm == realm) and a.enabled and a.access_token)
+
+    def realm_health(self, model=None, allow=None):
+        allowed = set(allow) if allow is not None else None
+        health = {}
+        for account in self.accounts:
+            if account.realm not in ("intl", "cn"):
+                continue
+            if allowed is not None and account.uid not in allowed:
+                continue
+            if account.ready(model=model):
+                health[account.realm] = health.get(account.realm, 0) + 1
+        return health
+
+    def pick_for_session(self, realm=None, session_key=None, exclude=None, model=None, allow=None):
+        exclude = exclude or set()
+        allowance = set(allow) if allow is not None else None
+        if session_key:
+            bound_uid = self.affinity.get(session_key)
+            if bound_uid and bound_uid not in exclude:
+                account = self.get(bound_uid)
+                if (account and account.realm == realm
+                        and (allowance is None or account.uid in allowance)
+                        and account.ready(model=model)):
+                    return account
+                self.affinity.unbind(session_key)
+        account = self.pick(realm=realm, exclude=exclude, model=model, allow=allowance)
+        if account and session_key:
+            self.affinity.bind(session_key, account.uid)
+        return account
+
+    def pick(self, realm=None, exclude=None, model=None, allow=None):
+        exclude = exclude or set()
+        allowance = set(allow) if allow is not None else None
+        candidates = [
+            a for a in self.accounts
+            if (not realm or a.realm == realm)
+            and (allowance is None or a.uid in allowance)
+        ]
+        if not candidates:
+            return None
+        start = self._cursor
+        for offset in range(len(candidates)):
+            index = (start + offset) % len(candidates)
+            account = candidates[index]
+            if account.uid in exclude:
+                continue
+            if account.ready(model=model):
+                self._cursor = (index + 1) % len(candidates)
+                return account
+        return None
+
+    def representative(self, realm=None):
+        candidates = [a for a in self.accounts if not realm or a.realm == realm]
+        for account in candidates:
+            if account.access_token:
+                return account
+        return candidates[0] if candidates else None
+
+    def start_login(self, realm="intl", platform="CLI"):
+        return self.pools[0].start_login(realm=realm, platform=platform)
+
+    def poll_login(self, state):
+        return self.pools[0].poll_login(state)
+
+    def cancel_login(self, state):
+        return self.pools[0].cancel_login(state)
+
+    def import_desktop_credential(self, path, realm=None, source="file"):
+        result = self.pools[0].import_desktop_credential(path=path, realm=realm, source=source)
+        self._rebuild()
+        return result
 
 
 def migrate_legacy_accounts(source_dir, target_tenant_dir, owner_user_id, *, dry_run=False):

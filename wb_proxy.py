@@ -705,6 +705,17 @@ _LEGACY_USAGE_DIR = USAGE_DIR
 _LEGACY_USAGE_LOG = USAGE_LOG
 _LEGACY_USAGE_SUMMARY = USAGE_SUMMARY
 
+class _AdminAggregateRuntime:
+    """Admin request view over global and tenant-owned account pools."""
+
+    def __init__(self, pool):
+        self.root = _LEGACY_ACCOUNTS_DIR
+        self.usage = _LEGACY_USAGE_DIR
+        self.usage_log = _LEGACY_USAGE_LOG
+        self.usage_summary = _LEGACY_USAGE_SUMMARY
+        self.pool = pool
+        self.scheduler = SCHEDULER
+
 class _TenantPoolProxy:
     def _value(self):
         runtime = _REQUEST_RUNTIME.get()
@@ -747,6 +758,20 @@ USAGE_DIR = _TenantPathProxy("_LEGACY_USAGE_DIR", "usage")
 USAGE_LOG = _TenantPathProxy("_LEGACY_USAGE_LOG", "usage_log")
 USAGE_SUMMARY = _TenantPathProxy("_LEGACY_USAGE_SUMMARY", "usage_summary")
 REALM_STATE_FILE = os.path.join(_LEGACY_ACCOUNTS_DIR, "active_realm.json")
+
+
+def _admin_aggregate_runtime():
+    if _LEGACY_POOL is None:
+        return None
+    runtimes = TENANT_MANAGER.list_runtimes() if TENANT_MANAGER else []
+    pool = wb_tenants.AggregateAccountPool(
+        [_LEGACY_POOL] + [runtime.pool for runtime in runtimes],
+        log=log,
+    )
+    pool.reload()
+    return _AdminAggregateRuntime(pool)
+
+
 def load_persisted_realm():
     global CURRENT_REALM
     if os.path.isfile(REALM_STATE_FILE):
@@ -3742,10 +3767,11 @@ class Handler(BaseHTTPRequestHandler):
         self.tenant_runtime = None
         self.principal = _oauth_principal(self)
         if self.principal and self.principal.principal_type == "aac-user":
-            # AAC administrators operate the legacy/global workspace.  Only
-            # ordinary users get a private tenant runtime.
+            # AAC administrators see the global workspace plus every tenant.
+            # Ordinary users stay confined to their own tenant runtime.
             if getattr(self.principal, "role", "") == "admin":
-                _REQUEST_RUNTIME.set(None)
+                self.tenant_runtime = _admin_aggregate_runtime()
+                _REQUEST_RUNTIME.set(self.tenant_runtime)
                 wb_patch_set_key(None)
                 return True
             try:
@@ -3778,7 +3804,10 @@ class Handler(BaseHTTPRequestHandler):
             self.tenant_runtime = TENANT_MANAGER.resolve_api_key_tenant(supplied)
             if self.tenant_runtime is not None:
                 scoped = wb_settings.resolve_api_key(supplied, "workbuddy2api-hub", tenant_dir=self.tenant_runtime.root)
-                self.key_entry = dict(scoped.__dict__) if scoped is not None else None
+                if scoped is not None:
+                    self.key_entry = dict(scoped.__dict__)
+                else:
+                    self.key_entry = wb_settings.match_api_key(self.tenant_runtime.root, supplied)
                 if self.key_entry:
                     self.principal = self.key_entry
                     _REQUEST_RUNTIME.set(self.tenant_runtime)
