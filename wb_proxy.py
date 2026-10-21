@@ -185,6 +185,9 @@ API_KEY_FILE_SET = False
 def configured_keys():
     """Panel-managed API keys, always read fresh so panel edits apply at once."""
     try:
+        runtime = _REQUEST_RUNTIME.get()
+        if getattr(runtime, "is_admin_aggregate", False):
+            return runtime.api_keys()
         return wb_settings.api_keys(ACCOUNTS_DIR)
     except Exception as exc:
         log("could not read api keys: %s" % exc)
@@ -708,13 +711,72 @@ _LEGACY_USAGE_SUMMARY = USAGE_SUMMARY
 class _AdminAggregateRuntime:
     """Admin request view over global and tenant-owned account pools."""
 
-    def __init__(self, pool):
-        self.root = _LEGACY_ACCOUNTS_DIR
+    is_admin_aggregate = True
+
+    def __init__(self, pool, global_accounts_dir, tenant_runtimes):
+        self.root = global_accounts_dir
         self.usage = _LEGACY_USAGE_DIR
         self.usage_log = _LEGACY_USAGE_LOG
         self.usage_summary = _LEGACY_USAGE_SUMMARY
         self.pool = pool
         self.scheduler = SCHEDULER
+        self.global_accounts_dir = global_accounts_dir
+        self.tenant_runtimes = list(tenant_runtimes)
+
+    @staticmethod
+    def _owner_label(runtime):
+        identity = runtime.workbuddy_user_id or runtime.aac_user_id
+        return "租户 " + str(identity)[-8:]
+
+    @staticmethod
+    def _scoped_keys(directory, scope, tenant_id, owner_label):
+        entries = []
+        for index, entry in enumerate(wb_settings.api_keys(directory)):
+            item = dict(entry)
+            storage_id = str(item.get("id") or "")
+            item["storage_id"] = storage_id
+            item["scope"] = scope
+            item["tenant_id"] = tenant_id
+            item["owner_label"] = owner_label
+            # Stored ids such as k0 and k10 are only unique within one
+            # settings file. Prefixing keeps every admin row addressable.
+            item["id"] = "%s:%s:%d:%s" % (
+                scope, tenant_id or "global", index, storage_id)
+            entries.append(item)
+        return entries
+
+    def api_keys(self):
+        entries = self._scoped_keys(
+            self.global_accounts_dir, "global", "", "全局")
+        for runtime in self.tenant_runtimes:
+            entries.extend(self._scoped_keys(
+                runtime.root,
+                "tenant",
+                runtime.aac_user_id,
+                self._owner_label(runtime),
+            ))
+        return entries
+
+    def api_key_scopes(self):
+        scopes = [{"scope": "global", "tenant_id": "", "label": "全局"}]
+        for runtime in self.tenant_runtimes:
+            if not wb_settings.api_keys(runtime.root):
+                continue
+            scopes.append({
+                "scope": "tenant",
+                "tenant_id": runtime.aac_user_id,
+                "label": self._owner_label(runtime),
+            })
+        return scopes
+
+    def api_key_dir(self, scope, tenant_id=""):
+        if scope == "global":
+            return self.global_accounts_dir
+        if scope == "tenant":
+            for runtime in self.tenant_runtimes:
+                if runtime.aac_user_id == tenant_id:
+                    return runtime.root
+        return None
 
 class _TenantPoolProxy:
     def _value(self):
@@ -769,7 +831,85 @@ def _admin_aggregate_runtime():
         log=log,
     )
     pool.reload()
-    return _AdminAggregateRuntime(pool)
+    return _AdminAggregateRuntime(
+        pool,
+        _LEGACY_ACCOUNTS_DIR,
+        runtimes,
+    )
+
+
+def _save_admin_api_keys(runtime, rows, requested_scopes=None):
+    """Save one aggregate list back to each Key's owning settings file."""
+    existing = {entry.get("id"): entry for entry in runtime.api_keys()}
+    grouped = {("global", ""): []}
+    declared = []
+    if requested_scopes is not None:
+        if not isinstance(requested_scopes, list):
+            raise ValueError("api_key_scopes must be a list")
+        for scope in requested_scopes:
+            if not isinstance(scope, dict):
+                raise ValueError("each api key scope must be an object")
+            scope_name = str(scope.get("scope") or "").strip()
+            tenant_id = str(scope.get("tenant_id") or "").strip()
+            if scope_name == "global":
+                tenant_id = ""
+            elif scope_name != "tenant":
+                raise ValueError("invalid api key scope")
+            if runtime.api_key_dir(scope_name, tenant_id) is None:
+                raise ValueError("unknown api key tenant")
+            key = (scope_name, tenant_id)
+            if key not in declared:
+                declared.append(key)
+                grouped.setdefault(key, [])
+
+    for item in rows:
+        if not isinstance(item, dict):
+            raise ValueError("each api key must be an object")
+        entry_id = str(item.get("id") or "").strip()
+        previous = existing.get(entry_id)
+        if previous is not None:
+            scope_name = previous.get("scope") or "global"
+            tenant_id = previous.get("tenant_id") or ""
+            storage_id = previous.get("storage_id") or ""
+        else:
+            scope_name = str(item.get("scope") or "global").strip()
+            tenant_id = str(item.get("tenant_id") or "").strip()
+            storage_id = "k" + secrets.token_hex(6)
+        if scope_name == "global":
+            tenant_id = ""
+        elif scope_name != "tenant":
+            raise ValueError("invalid api key scope")
+        if runtime.api_key_dir(scope_name, tenant_id) is None:
+            raise ValueError("unknown api key tenant")
+        value = str(item.get("key") or "").strip()
+        if not value and previous is not None:
+            value = previous.get("key") or ""
+        if value and len(value) < 4:
+            raise ValueError("api key must be at least 4 characters")
+        if not value:
+            raise ValueError("a key entry is empty - fill it in or remove the row")
+        accounts = item.get("accounts")
+        if isinstance(accounts, (list, tuple)):
+            accounts = [str(x).strip() for x in accounts if str(x).strip()]
+        else:
+            accounts = []
+        grouped.setdefault((scope_name, tenant_id), []).append({
+            "id": storage_id,
+            "name": str(item.get("name") or "").strip(),
+            "key": value,
+            "realm": normalize_panel_key_realm(item.get("realm")),
+            "enabled": item.get("enabled", True) is not False,
+            "accounts": accounts,
+        })
+
+    saved = 0
+    for (scope_name, tenant_id), entries in grouped.items():
+        settings_dir = runtime.api_key_dir(scope_name, tenant_id)
+        if settings_dir is None:
+            continue
+        cleaned = wb_settings.set_api_keys(settings_dir, entries)
+        saved += len(cleaned)
+    return saved
 
 
 def load_persisted_realm():
@@ -1044,6 +1184,9 @@ def runtime_settings_view():
             "accounts": entry.get("accounts") or [],
             "masked": (raw[:4] + "*" * 6 + raw[-4:]) if len(raw) > 8 else "*" * len(raw),
             "source": entry.get("source") or "panel",
+            "scope": entry.get("scope") or "",
+            "tenant_id": entry.get("tenant_id") or "",
+            "owner_label": entry.get("owner_label") or "",
         })
     # PATCH(wb-hub-key-accounts) 给面板的「限定账号」勾选框提供候选（不过滤 realm，跨出口也要能选）
     _acct_opts = []
@@ -1058,6 +1201,8 @@ def runtime_settings_view():
             })
     except Exception:
         _acct_opts = []
+    runtime = _REQUEST_RUNTIME.get()
+    manage_all_keys = bool(getattr(runtime, "is_admin_aggregate", False))
     return {
         "account_options": _acct_opts,
         # PATCH(wb-hub-account-alias) 整张别名表给前端，任务页/看板都能按 uid 反查显示名
@@ -1071,6 +1216,8 @@ def runtime_settings_view():
         "api_key_masked": masked,
         "auth_required": auth_required(),
         "api_keys": keys,
+        "api_key_manage_all": manage_all_keys,
+        "api_key_scopes": runtime.api_key_scopes() if manage_all_keys else [],
         "accounts_dir": str(ACCOUNTS_DIR),
         "usage_dir": str(USAGE_DIR),
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
@@ -4233,9 +4380,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/settings/reveal":
             # The panel only ever draws masked keys, so copying one needs an
-            # explicit request. Panel session required, API key is not enough.
-            if not self._panel_ok():
+            # explicit request. AAC users remain scoped to their own tenant.
+            principal = _oauth_principal(self)
+            if not self._panel_ok() and not (
+                    principal and getattr(principal, "role", "") in ("admin", "user")):
                 return self._error(401, "panel password required", "invalid_request_error")
+            if not self._key_ok():
+                return self._error(401, "login required", "invalid_request_error")
             wanted = (query.get("id") or [""])[0]
             for entry in configured_keys():
                 if entry.get("id") == wanted:
@@ -4301,43 +4452,54 @@ class Handler(BaseHTTPRequestHandler):
             raw = payload.get("api_keys")
             if not isinstance(raw, list):
                 return self._error(400, "api_keys must be a list", "invalid_request_error")
-            # The panel only ever shows a masked key, so a blank value means
-            # "keep what is stored" for that row rather than "clear it".
-            existing = {entry.get("id"): entry for entry in configured_keys()}
-            cleaned = []
-            for index, item in enumerate(raw):
-                if not isinstance(item, dict):
-                    return self._error(400, "each api key must be an object",
-                                       "invalid_request_error")
-                entry_id = str(item.get("id") or "").strip()
-                value = str(item.get("key") or "").strip()
-                if not value and entry_id and entry_id in existing:
-                    value = existing[entry_id].get("key") or ""
-                if not entry_id:
-                    entry_id = "k%d" % index
-                if value and len(value) < 4:
-                    return self._error(400, "api key must be at least 4 characters",
-                                       "invalid_request_error")
-                if not value:
-                    return self._error(400, "a key entry is empty - fill it in or remove the row",
-                                       "invalid_request_error")
-                realm = normalize_panel_key_realm(item.get("realm"))
-                # PATCH(wb-hub-key-accounts) 面板勾选的账号白名单，空 = 不限
-                accounts = item.get("accounts")
-                if isinstance(accounts, (list, tuple)):
-                    accounts = [str(x).strip() for x in accounts if str(x).strip()]
-                else:
-                    accounts = []
-                cleaned.append({
-                    "id": entry_id,
-                    "name": str(item.get("name") or "").strip(),
-                    "key": value,
-                    "realm": realm,
-                    "enabled": item.get("enabled", True) is not False,
-                    "accounts": accounts,
-                })
-            wb_settings.set_api_keys(ACCOUNTS_DIR, cleaned)
-            reply["api_keys_saved"] = len(cleaned)
+            if getattr(self.tenant_runtime, "is_admin_aggregate", False):
+                try:
+                    saved = _save_admin_api_keys(
+                        self.tenant_runtime,
+                        raw,
+                        payload.get("api_key_scopes"),
+                    )
+                except ValueError as exc:
+                    return self._error(400, str(exc), "invalid_request_error")
+                reply["api_keys_saved"] = saved
+            else:
+                # The panel only ever shows a masked key, so a blank value means
+                # "keep what is stored" for that row rather than "clear it".
+                existing = {entry.get("id"): entry for entry in configured_keys()}
+                cleaned = []
+                for index, item in enumerate(raw):
+                    if not isinstance(item, dict):
+                        return self._error(400, "each api key must be an object",
+                                           "invalid_request_error")
+                    entry_id = str(item.get("id") or "").strip()
+                    value = str(item.get("key") or "").strip()
+                    if not value and entry_id and entry_id in existing:
+                        value = existing[entry_id].get("key") or ""
+                    if not entry_id:
+                        entry_id = "k%d" % index
+                    if value and len(value) < 4:
+                        return self._error(400, "api key must be at least 4 characters",
+                                           "invalid_request_error")
+                    if not value:
+                        return self._error(400, "a key entry is empty - fill it in or remove the row",
+                                           "invalid_request_error")
+                    realm = normalize_panel_key_realm(item.get("realm"))
+                    # PATCH(wb-hub-key-accounts) 面板勾选的账号白名单，空 = 不限
+                    accounts = item.get("accounts")
+                    if isinstance(accounts, (list, tuple)):
+                        accounts = [str(x).strip() for x in accounts if str(x).strip()]
+                    else:
+                        accounts = []
+                    cleaned.append({
+                        "id": entry_id,
+                        "name": str(item.get("name") or "").strip(),
+                        "key": value,
+                        "realm": realm,
+                        "enabled": item.get("enabled", True) is not False,
+                        "accounts": accounts,
+                    })
+                wb_settings.set_api_keys(ACCOUNTS_DIR, cleaned)
+                reply["api_keys_saved"] = len(cleaned)
         if "auth_disabled" in payload:
             wb_settings.set_auth_disabled(ACCOUNTS_DIR, payload.get("auth_disabled"))
             reply["auth_disabled"] = bool(payload.get("auth_disabled"))

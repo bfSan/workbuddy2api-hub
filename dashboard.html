@@ -2661,7 +2661,12 @@ async function loadSettings(showToast){
       realm: k.realm || 'auto',
       enabled: k.enabled !== false,
       accounts: k.accounts || [],
+      scope: k.scope || '',
+      tenant_id: k.tenant_id || '',
+      owner_label: k.owner_label || '',
     }));
+    API_KEY_MANAGE_ALL = data.api_key_manage_all === true;
+    API_KEY_SCOPES = data.api_key_scopes || [];
     window.ACCOUNT_OPTIONS = data.account_options || [];
     window.ACCOUNT_ALIASES = data.account_aliases || {};
     // The rows were just rebuilt from the server, so page 1 is the only
@@ -2706,6 +2711,8 @@ async function savePanelPassword(btn){
 
 /* ---- API key list: several keys, each bound to an upstream exit ---- */
 let API_KEY_ROWS = [];
+let API_KEY_MANAGE_ALL = false;
+let API_KEY_SCOPES = [];
 
 function randomKeyValue(){
   const bytes = new Uint8Array(18);
@@ -2874,6 +2881,9 @@ function keyRowHtml(row, i, flip){
     const maskedHint = row.masked
       ? '<span class="key-masked" title="已保存的 Key: ' + esc(row.masked) + '">已保存</span>'
       : '';
+    const ownerHint = row.owner_label
+      ? '<span class="badge s" title="Key 归属">' + esc(row.owner_label) + '</span>'
+      : '';
     return '<div class="keyrow">'
       + '<input class="key-name" type="text" value="' + esc(row.name || '') + '" placeholder="备注名" '
       +   'oninput="updateKeyRow(' + i + ',\'name\', this.value)">'
@@ -2885,6 +2895,7 @@ function keyRowHtml(row, i, flip){
       +   ' onchange="updateKeyRow(' + i + ',\'enabled\', this.checked)">启用</label>'
       + '<button class="sec mini" onclick="generateKeyRow(' + i + ')">随机生成</button>'
       + '<button class="danger mini" onclick="removeKeyRow(' + i + ')">删除</button>'
+      + ownerHint
       + keyAccountDropdown(i, row, flip)
       + maskedHint
       + '</div>';
@@ -2967,7 +2978,8 @@ async function writeClipboard(text){
 }
 
 function addApiKeyRow(){
-  API_KEY_ROWS.push({id: '', name: '', key: '', realm: 'auto', enabled: true, masked: ''});
+  API_KEY_ROWS.push({id: '', name: '', key: '', realm: 'auto', enabled: true,
+                     masked: '', scope: 'global', tenant_id: '', owner_label: '全局'});
   // Land on the last page so the new row is actually visible; applyView()
   // clamps this deliberate over-shoot down to the real final page.
   PAGE_STATE.keys.page = API_KEY_ROWS.length;
@@ -2992,6 +3004,8 @@ async function saveApiKeys(btn){
     // Blank means "keep the stored key", which the server honours per row.
     key: (row.key || '').trim(),
     accounts: (row.accounts || []).slice(),
+    scope: row.scope || 'global',
+    tenant_id: row.tenant_id || '',
   }));
   const newRow = API_KEY_ROWS.find(row => !row.masked && !(row.key || '').trim());
   if(newRow){
@@ -3000,7 +3014,9 @@ async function saveApiKeys(btn){
   }
   btn.disabled = true;
   try {
-    await postJSON('/settings/save', {api_keys: payload});
+    const body = {api_keys: payload};
+    if(API_KEY_MANAGE_ALL) body.api_key_scopes = API_KEY_SCOPES;
+    await postJSON('/settings/save', body);
     toast('已保存 ' + payload.length + ' 个 Key', 'ok');
     loadSettings();
   } catch(e) {
