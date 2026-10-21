@@ -136,7 +136,12 @@ class Scheduler:
             exp = acc.expires_at or 0
             if exp and (exp - time.time()) < 7200:
                 self.log(f"账号 [{uid8}] Token 即将到期，执行主动保活刷新...")
-                if acc.refresh():
+                try:
+                    refreshed = acc.refresh()
+                except Exception as exc:
+                    acc.last_error = "refresh failed: %s" % exc
+                    refreshed = False
+                if refreshed:
                     refreshed_count += 1
                     self.log(f"✓ 账号 [{uid8}] Token 自动保活刷新成功")
                 else:

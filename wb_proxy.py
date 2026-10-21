@@ -4764,7 +4764,11 @@ class Handler(BaseHTTPRequestHandler):
             for account in targets:
                 if account is None:
                     continue
-                ok = POOL.refresh_account(account)
+                try:
+                    ok = POOL.refresh_account(account)
+                except Exception as exc:
+                    account.last_error = "refresh failed: %s" % exc
+                    ok = False
                 results.append({"uid": account.uid, "ok": ok, "error": account.last_error})
             return self._json(200, {"results": results})
         if path == "/accounts/set":

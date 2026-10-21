@@ -71,6 +71,7 @@ if [[ "${SKIP_TESTS:-0}" != "1" ]]; then
     "$VENV_DIR/bin/python" _test_cat_travel.py
     "$VENV_DIR/bin/python" _test_unified_panel.py
     "$VENV_DIR/bin/python" _test_api_key_scope.py
+    "$VENV_DIR/bin/python" _test_refresh_resilience.py
     "$VENV_DIR/bin/python" _test_gateway_key_status.py
     "$VENV_DIR/bin/python" _test_tenant_isolation.py
     "$VENV_DIR/bin/python" _test_admin_aggregate.py

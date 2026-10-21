@@ -404,7 +404,11 @@ class Account(object):
         self.last_error = self.realm_error if self.realm == "unknown" else ""
         self.cooldown_until = 0
         if self.path and os.path.exists(os.path.dirname(self.path)):
-            self.save(os.path.dirname(self.path))
+            try:
+                self.save(os.path.dirname(self.path))
+            except Exception as exc:
+                self.last_error = "refreshed token could not be saved: %s" % exc
+                return False
         return True
 
     def can_checkin(self):
