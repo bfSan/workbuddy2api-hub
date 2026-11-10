@@ -225,5 +225,32 @@ standard = json.dumps({"choices": [{"delta": {"tool_calls": [{
 check("standard OpenAI argument-only delta is unchanged", P.clean_chunk(standard) == standard)
 
 print()
+print("[page context] Codex desktop snapshots without call_id are context, not tool results")
+page_items = [
+    {"type": "function_call_output", "namespace": "agent", "name": "codex_apps_open_page", "output": '{"page_id":null}'},
+    {"type": "function_call_output", "namespace": "agent", "name": "codex_apps_selected_page_part_1_of_1", "output": 'Companion Page snapshot part 1 of 1:\n{"page_id":null,"document_view":null}'},
+]
+page_messages = P.responses_to_chat({"input": page_items + [{"role": "user", "content": "hi"}]})["messages"]
+check("snapshots produce no orphan tool results", not any(m.get("role") == "tool" for m in page_messages))
+check("both snapshots and user message are retained", len(page_messages) == 3)
+check("snapshot text is preserved", all(item["output"] in page_messages[i]["content"] for i, item in enumerate(page_items)))
+check("snapshots use ordinary context messages", all(m["role"] == "user" for m in page_messages))
+paired = P.responses_to_chat({"input": [
+    {"type": "function_call", "name": "codex_apps_open_page", "call_id": "real_call", "arguments": "{}"},
+    dict(page_items[0], call_id="real_call"),
+]})["messages"]
+check("real named tool results retain their call_id", paired[-1].get("tool_call_id") == "real_call" and paired[-1]["role"] == "tool")
+deferred = P.responses_to_chat({"input": [
+    {"type": "function_call", "name": "test", "call_id": "pending_call", "arguments": "{}"},
+    page_items[0],
+    {"type": "function_call_output", "call_id": "pending_call", "output": "ok"},
+]})["messages"]
+check("page context does not interrupt pending tool results", [m["role"] for m in deferred] == ["assistant", "tool", "user"])
+for value in ({"page_id": None}, None):
+    converted = P.responses_to_chat({"input": [dict(page_items[0], output=value)]})["messages"]
+    check("non-string snapshot output remains readable", converted[0]["content"].endswith(json.dumps(value, ensure_ascii=False)))
+unknown = P.responses_to_chat({"input": [dict(page_items[0], name="unrelated_tool")]})["messages"]
+check("unrelated tool outputs are not reclassified", unknown[0]["role"] == "tool")
+print()
 print("SUMMARY: PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

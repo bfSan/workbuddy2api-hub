@@ -3118,6 +3118,22 @@ def responses_to_chat(payload):
                             prev["content"] = body
                     else:
                         append_message({"role": role, "content": body})
+            elif (itype == "function_call_output"
+                  and not item.get("call_id")
+                  and item.get("namespace") == "agent"
+                  and (item.get("name") == "codex_apps_open_page"
+                       or str(item.get("name") or "").startswith("codex_apps_selected_page_part_"))):
+                # Codex desktop injects page snapshots without a corresponding
+                # tool call. Preserve them as context, never as orphan tool results.
+                raw_out = item.get("output")
+                if isinstance(raw_out, str):
+                    context = raw_out
+                else:
+                    context = json.dumps(raw_out, ensure_ascii=False)
+                append_message({
+                    "role": "user",
+                    "content": "Codex desktop page context (%s):\n%s" % (item["name"], context),
+                })
             elif itype == "function_call_output":
                 raw_out = item.get("output")
                 if isinstance(raw_out, list):
